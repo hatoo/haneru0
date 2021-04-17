@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::File,
@@ -47,6 +48,7 @@ pub struct DiskManager {
 
 impl DiskManager {
     pub fn new(heap_file: File) -> Result<Self, std::io::Error> {
+        heap_file.lock_exclusive()?;
         let heap_file_size = heap_file.metadata()?.len();
         let next_page_id = heap_file_size / PAGE_SIZE as u64;
         let ring = rio::new()?;

@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 rio = "0.9.4"
 libc = "0.2.93"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tokio = { version = "1.5.0", features = ["full"] }
