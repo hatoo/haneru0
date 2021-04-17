@@ -2,7 +2,10 @@ use crate::disk::Aligned;
 use crate::disk::DiskManager;
 use crate::disk::PageId;
 use async_rwlock::RwLock;
-use std::sync::Arc;
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
 struct BufferId(usize);
 
@@ -12,12 +15,16 @@ pub struct Page {
     is_dirty: bool,
 }
 
-impl Page {
-    pub fn get(&self) -> &Aligned {
+impl Deref for Page {
+    type Target = Aligned;
+
+    fn deref(&self) -> &Self::Target {
         &self.page
     }
+}
 
-    pub fn get_mut(&mut self) -> &mut Aligned {
+impl DerefMut for Page {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         self.is_dirty = true;
         &mut self.page
     }
@@ -169,7 +176,7 @@ impl BufferPoolManager {
             self.page_table.remove(&prev_buffer.page_id);
             if lock.is_dirty {
                 self.disk
-                    .write_page_data(prev_buffer.page_id, lock.get())
+                    .write_page_data(prev_buffer.page_id, &lock)
                     .await?;
             }
         }
@@ -184,10 +191,7 @@ impl Drop for BufferPoolManager {
                 let buffer = self.pool.get(buffer_id);
                 let lock = buffer.page.read().await;
                 if lock.is_dirty {
-                    self.disk
-                        .write_page_data(page_id, lock.get())
-                        .await
-                        .unwrap();
+                    self.disk.write_page_data(page_id, &lock).await.unwrap();
                 }
             }
         });
@@ -211,12 +215,7 @@ mod tests {
             let disk_manager = DiskManager::open(&path).unwrap();
             let mut buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
             let buffer = buffer_pool_manager.create_page().await.unwrap();
-            buffer
-                .page
-                .write()
-                .await
-                .get_mut()
-                .copy_from_slice(&memory[..]);
+            buffer.page.write().await.copy_from_slice(&memory[..]);
         }
 
         {
@@ -227,7 +226,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(buffer.page.read().await.get(), &memory);
+            assert_eq!(buffer.page.read().await.deref().deref(), &memory);
         }
     }
 }
