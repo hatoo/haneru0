@@ -1,0 +1,16 @@
+[package]
+name = "haneru"
+version = "0.1.0"
+authors = ["hatoo <hato2000@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rio = "0.9.4"
+libc = "0.2.93"
+
+[dev-dependencies]
+tokio = { version = "1.5.0", features = ["full"] }
+tempfile = "3.1"
+rand = "0.8.3"
