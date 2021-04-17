@@ -76,6 +76,8 @@ impl DiskManager {
         page_id: PageId,
         data: &mut Aligned,
     ) -> Result<(), std::io::Error> {
+        assert!(page_id.0 < self.next_page_id);
+
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut read_len = self
             .ring
@@ -105,6 +107,8 @@ impl DiskManager {
         page_id: PageId,
         data: &Aligned,
     ) -> Result<(), std::io::Error> {
+        assert!(page_id.0 <= self.next_page_id);
+
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = self.ring.write_at(&self.heap_file, &data.0, at).await?;
         while written_len < PAGE_SIZE {
