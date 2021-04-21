@@ -202,7 +202,10 @@ impl BufferPoolManager {
         lock.page_table.insert(page_id, buffer_id);
         let buffer = Buffer {
             page_id,
-            page: Default::default(),
+            page: RwLock::new(Page {
+                is_dirty: true,
+                page: Default::default(),
+            }),
         };
         lock.pool.insert(buffer_id, buffer);
         Ok(lock.pool.get(buffer_id))
@@ -226,7 +229,7 @@ impl Drop for BufferPoolManager {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
+    use rand::prelude::*;
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -253,6 +256,65 @@ mod tests {
                 .unwrap();
 
             assert_eq!(buffer.page.read().await.deref().deref(), &memory);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_pool_manager_concurrent() {
+        const N_PAGES: usize = 64;
+        const POOL_SIZE: usize = 4;
+        const N_ITER: u8 = 16;
+
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+        let mut pages = Vec::new();
+        {
+            let disk_manager = DiskManager::open(&path).unwrap();
+            let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
+
+            for _ in 0..N_PAGES {
+                pages.push(buffer_pool_manager.create_page().await.unwrap().page_id);
+            }
+
+            let mut rng = thread_rng();
+            pages.shuffle(&mut rng);
+
+            let buffer_pool_manager = Arc::new(buffer_pool_manager);
+
+            let v = pages
+                .chunks(POOL_SIZE)
+                .map(|page_ids| {
+                    let mut page_ids = page_ids.to_vec();
+                    let buffer_pool_manager = buffer_pool_manager.clone();
+                    tokio::spawn(async move {
+                        let mut rng = StdRng::from_entropy();
+                        for v in 1..=N_ITER {
+                            page_ids.shuffle(&mut rng);
+                            for &page_id in &page_ids {
+                                let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
+                                assert_eq!(page_id, buffer.page_id);
+                                let mut lock = buffer.page.write().await;
+                                lock.fill(v);
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for f in v {
+                f.await.unwrap();
+            }
+        }
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
+        for page_id in pages {
+            let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
+            assert!(buffer
+                .page
+                .read()
+                .await
+                .deref()
+                .iter()
+                .all(|&v| v == N_ITER));
         }
     }
 }
