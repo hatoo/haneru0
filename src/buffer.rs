@@ -76,6 +76,7 @@ impl<T: std::fmt::Debug> BufferPool<T> {
                     if f.usage_count.load(Ordering::Acquire) == 0
                     // Always Arc::strong_count(&f.buffer) == 1
                     {
+                        debug_assert_eq!(Arc::strong_count(&f.buffer), 1);
                         let last = frame.take().map(|g| Arc::try_unwrap(g.buffer).unwrap());
                         return Some((next_victim_id, last));
                     }
@@ -308,13 +309,7 @@ mod tests {
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
         for page_id in pages {
             let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
-            assert!(buffer
-                .page
-                .read()
-                .await
-                .deref()
-                .iter()
-                .all(|&v| v == N_ITER));
+            assert!(buffer.page.read().await.iter().all(|&v| v == N_ITER));
         }
     }
 }
