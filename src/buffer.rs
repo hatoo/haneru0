@@ -33,8 +33,8 @@ impl DerefMut for Page {
 
 #[derive(Debug)]
 pub struct Buffer {
-    page_id: PageId,
-    page: RwLock<Page>,
+    pub page_id: PageId,
+    pub page: RwLock<Page>,
 }
 
 struct Frame<T> {
