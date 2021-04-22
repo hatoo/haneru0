@@ -85,6 +85,13 @@ impl DiskManager {
             .read_at(&self.heap_file, data.deref_mut(), at)
             .await?;
 
+        if read_len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+
         while read_len < PAGE_SIZE {
             let mut buf = Aligned::default();
             let len = self
@@ -95,6 +102,13 @@ impl DiskManager {
                     at + read_len as u64,
                 )
                 .await?;
+
+            if len == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
 
             data[read_len..read_len + len].copy_from_slice(&buf[..read_len]);
 
