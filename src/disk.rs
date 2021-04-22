@@ -80,35 +80,47 @@ impl DiskManager {
         assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
 
         let at = page_id.0 * PAGE_SIZE as u64;
-        let mut read_len = self
-            .ring
-            .read_at(&self.heap_file, data.deref_mut(), at)
-            .await?;
-
-        if read_len == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "failed to fill whole buffer",
-            ));
-        }
+        let mut read_len = loop {
+            match self
+                .ring
+                .read_at(&self.heap_file, data.deref_mut(), at)
+                .await
+            {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ))
+                }
+                Ok(n) => break n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        };
 
         while read_len < PAGE_SIZE {
             let mut buf = Aligned::default();
-            let len = self
-                .ring
-                .read_at(
-                    &self.heap_file,
-                    &mut buf[..PAGE_SIZE - read_len].as_mut(),
-                    at + read_len as u64,
-                )
-                .await?;
-
-            if len == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ));
-            }
+            let len = loop {
+                match self
+                    .ring
+                    .read_at(
+                        &self.heap_file,
+                        &mut buf[..PAGE_SIZE - read_len].as_mut(),
+                        at + read_len as u64,
+                    )
+                    .await
+                {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        ))
+                    }
+                    Ok(n) => break n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
 
             data[read_len..read_len + len].copy_from_slice(&buf[..read_len]);
 
@@ -125,18 +137,43 @@ impl DiskManager {
         assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
 
         let at = page_id.0 * PAGE_SIZE as u64;
-        let mut written_len = self.ring.write_at(&self.heap_file, &data.0, at).await?;
+        let mut written_len = loop {
+            match self.ring.write_at(&self.heap_file, &data.0, at).await {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ))
+                }
+                Ok(n) => break n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        };
         while written_len < PAGE_SIZE {
             let mut buf = Aligned::default();
             buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
-            written_len += self
-                .ring
-                .write_at(
-                    &self.heap_file,
-                    &buf[..PAGE_SIZE - written_len].as_ref(),
-                    at + written_len as u64,
-                )
-                .await?;
+            written_len += loop {
+                match self
+                    .ring
+                    .write_at(
+                        &self.heap_file,
+                        &buf[..PAGE_SIZE - written_len].as_ref(),
+                        at + written_len as u64,
+                    )
+                    .await
+                {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        ))
+                    }
+                    Ok(n) => break n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
         }
 
         Ok(())
