@@ -1,4 +1,3 @@
-use async_mutex::Mutex;
 use async_rwlock::RwLock;
 use fs2::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -45,22 +44,20 @@ impl PageId {
 pub struct DiskManager {
     heap_file: File,
     ring: rio::Rio,
-    next_page_id: Mutex<u64>,
-    write_lock: RwLock<()>,
+    next_page_id: RwLock<u64>,
 }
 
 impl DiskManager {
     pub fn new(heap_file: File) -> Result<Self, std::io::Error> {
         heap_file.lock_exclusive()?;
         let heap_file_size = heap_file.metadata()?.len();
-        let next_page_id = Mutex::new(heap_file_size / PAGE_SIZE as u64);
+        let next_page_id = RwLock::new(heap_file_size / PAGE_SIZE as u64);
         let ring = rio::new()?;
 
         Ok(Self {
             heap_file,
             ring,
             next_page_id,
-            write_lock: Default::default(),
         })
     }
 
@@ -80,7 +77,7 @@ impl DiskManager {
         page_id: PageId,
         data: &mut Aligned,
     ) -> Result<(), std::io::Error> {
-        debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
+        debug_assert!(page_id.0 < *self.next_page_id.read().await.deref());
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut read_len = loop {
@@ -147,8 +144,9 @@ impl DiskManager {
         for_create: bool,
     ) -> Result<(), std::io::Error> {
         let _write_lock = if !for_create {
-            debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
-            Some(self.write_lock.read().await)
+            let lock = self.next_page_id.read().await;
+            debug_assert!(page_id.0 < *lock.deref());
+            Some(lock)
         } else {
             None
         };
@@ -202,19 +200,17 @@ impl DiskManager {
         PageId,
         impl '_ + std::future::Future<Output = Result<(), std::io::Error>>,
     ) {
-        let lock = self.write_lock.write().await;
-        let mut guard = self.next_page_id.lock().await;
-        let page_id = *guard.deref();
+        let mut lock = self.next_page_id.write().await;
+        let page_id = *lock.deref();
 
         (PageId(page_id), async move {
-            let _lock = lock;
             let zero = Aligned::default();
 
             // Write some data to avoid fragment
             self.my_write_page_data(PageId(page_id), &zero, true)
                 .await?;
 
-            *guard.deref_mut() += 1;
+            *lock.deref_mut() += 1;
             Ok(())
         })
     }
