@@ -294,6 +294,7 @@ impl BufferPoolManager {
                 page: Default::default(),
             },
         );
+        let buffer = lock.pool.get(buffer_id);
         std::mem::drop(lock);
 
         if let Err(err) = f.await {
@@ -306,15 +307,7 @@ impl BufferPoolManager {
 
         lock.page_table
             .insert(page_id, PageTableItem::Read(buffer_id));
-        let buffer = Buffer {
-            page_id,
-            page: RwLock::new(Page {
-                is_dirty: false,
-                page: Default::default(),
-            }),
-        };
-        lock.pool.insert(buffer_id, buffer);
-        Ok(lock.pool.get(buffer_id))
+        Ok(buffer)
     }
 }
 
