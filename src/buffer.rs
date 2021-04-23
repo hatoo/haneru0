@@ -211,11 +211,21 @@ impl BufferPoolManager {
                 std::mem::drop(lock);
 
                 let mut page = Aligned::default();
-                self.disk.read_page_data(page_id, &mut page).await?;
+                if let Err(err) = self.disk.read_page_data(page_id, &mut page).await {
+                    let mut lock = self.page_pool.write().await;
+                    lock.page_table.remove(&page_id);
+                    return Err(err.into());
+                }
 
                 let mut lock = self.page_pool.write().await;
 
-                let buffer_id = lock.alloc_page(&self.disk).await?;
+                let buffer_id = match lock.alloc_page(&self.disk).await {
+                    Ok(buffer_id) => buffer_id,
+                    Err(err) => {
+                        lock.page_table.remove(&page_id);
+                        return Err(err.into());
+                    }
+                };
 
                 lock.page_table
                     .insert(page_id, PageTableItem::Read(buffer_id));
