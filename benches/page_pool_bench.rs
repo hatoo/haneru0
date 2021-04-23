@@ -53,6 +53,52 @@ fn criterion_benchmark(c: &mut Criterion) {
             }
         })
     });
+    c.bench_function("pool_manager_write_create", |b| {
+        b.to_async(&rt).iter(|| async {
+            use haneru::buffer::BufferPoolManager;
+            use haneru::disk::DiskManager;
+            use rand::prelude::*;
+            use std::ops::DerefMut;
+            use std::sync::Arc;
+            use tempfile::NamedTempFile;
+
+            let path = NamedTempFile::new().unwrap().into_temp_path();
+
+            let disk_manager = DiskManager::open(&path).unwrap();
+            let buffer_pool_manager = BufferPoolManager::new(disk_manager, 4);
+
+            let buffer_pool_manager = Arc::new(buffer_pool_manager);
+            let v = (0..4)
+                .map(|_| {
+                    let buffer_pool_manager = buffer_pool_manager.clone();
+                    tokio::spawn(async move {
+                        let mut rng = rand::rngs::StdRng::from_entropy();
+                        let mut pages = Vec::new();
+                        for _ in 0usize..8 {
+                            let page_id = buffer_pool_manager.create_page().await.unwrap().page_id;
+                            pages.push(page_id);
+                            pages.shuffle(&mut rng);
+                            for &page_id in &pages {
+                                let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
+                                rng.fill_bytes(
+                                    buffer
+                                        .page
+                                        .write()
+                                        .await
+                                        .deref_mut()
+                                        .deref_mut()
+                                        .deref_mut(),
+                                );
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for f in v {
+                f.await.unwrap();
+            }
+        })
+    });
 }
 
 criterion_group!(benches, criterion_benchmark);

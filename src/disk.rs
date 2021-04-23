@@ -1,4 +1,5 @@
 use async_mutex::Mutex;
+use async_rwlock::RwLock;
 use fs2::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
@@ -45,6 +46,7 @@ pub struct DiskManager {
     heap_file: File,
     ring: rio::Rio,
     next_page_id: Mutex<u64>,
+    write_lock: RwLock<()>,
 }
 
 impl DiskManager {
@@ -58,6 +60,7 @@ impl DiskManager {
             heap_file,
             ring,
             next_page_id,
+            write_lock: Default::default(),
         })
     }
 
@@ -134,11 +137,21 @@ impl DiskManager {
         page_id: PageId,
         data: &Aligned,
     ) -> Result<(), std::io::Error> {
-        debug_assert!(self
-            .next_page_id
-            .try_lock()
-            .map(|guard| page_id.0 < *guard.deref())
-            .unwrap_or(true));
+        self.my_write_page_data(page_id, data, false).await
+    }
+
+    async fn my_write_page_data(
+        &self,
+        page_id: PageId,
+        data: &Aligned,
+        for_create: bool,
+    ) -> Result<(), std::io::Error> {
+        let _write_lock = if !for_create {
+            debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
+            Some(self.write_lock.read().await)
+        } else {
+            None
+        };
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = loop {
@@ -183,18 +196,27 @@ impl DiskManager {
         Ok(())
     }
 
-    pub async fn allocate_page(&self) -> Result<PageId, std::io::Error> {
+    pub async fn allocate_page(
+        &self,
+    ) -> (
+        PageId,
+        impl '_ + std::future::Future<Output = Result<(), std::io::Error>>,
+    ) {
+        let lock = self.write_lock.write().await;
         let mut guard = self.next_page_id.lock().await;
         let page_id = *guard.deref();
 
-        let zero = Aligned::default();
+        (PageId(page_id), async move {
+            let _lock = lock;
+            let zero = Aligned::default();
 
-        // Write some data to avoid fragment
-        self.write_page_data(PageId(page_id), &zero).await?;
+            // Write some data to avoid fragment
+            self.my_write_page_data(PageId(page_id), &zero, true)
+                .await?;
 
-        *guard.deref_mut() += 1;
-
-        Ok(PageId(page_id))
+            *guard.deref_mut() += 1;
+            Ok(())
+        })
     }
 
     pub async fn sync(&self) -> Result<(), std::io::Error> {
@@ -217,7 +239,8 @@ mod tests {
     async fn test_disk_manager_read_write_1() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
         let disk_manager = DiskManager::open(&path).unwrap();
-        let page_id = disk_manager.allocate_page().await.unwrap();
+        let (page_id, f) = disk_manager.allocate_page().await;
+        f.await.unwrap();
         let mut write_buf = Aligned::default();
 
         rand::thread_rng().fill_bytes(&mut write_buf[..]);
@@ -252,7 +275,9 @@ mod tests {
 
         let mut pages: Vec<PageId> = Vec::new();
         for _ in 0..N_PAGES {
-            pages.push(disk_manager.allocate_page().await.unwrap());
+            let (page_id, f) = disk_manager.allocate_page().await;
+            f.await.unwrap();
+            pages.push(page_id);
         }
 
         let mut memory: std::collections::HashMap<PageId, Aligned> = Default::default();
