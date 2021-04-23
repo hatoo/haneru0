@@ -1,6 +1,6 @@
+use async_mutex::Mutex;
 use fs2::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs::File,
     ops::{Deref, DerefMut},
@@ -44,14 +44,14 @@ impl PageId {
 pub struct DiskManager {
     heap_file: File,
     ring: rio::Rio,
-    next_page_id: AtomicU64,
+    next_page_id: Mutex<u64>,
 }
 
 impl DiskManager {
     pub fn new(heap_file: File) -> Result<Self, std::io::Error> {
         heap_file.lock_exclusive()?;
         let heap_file_size = heap_file.metadata()?.len();
-        let next_page_id = AtomicU64::new(heap_file_size / PAGE_SIZE as u64);
+        let next_page_id = Mutex::new(heap_file_size / PAGE_SIZE as u64);
         let ring = rio::new()?;
 
         Ok(Self {
@@ -77,7 +77,7 @@ impl DiskManager {
         page_id: PageId,
         data: &mut Aligned,
     ) -> Result<(), std::io::Error> {
-        assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+        debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut read_len = loop {
@@ -134,7 +134,7 @@ impl DiskManager {
         page_id: PageId,
         data: &Aligned,
     ) -> Result<(), std::io::Error> {
-        assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+        debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = loop {
@@ -179,9 +179,19 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn allocate_page(&self) -> PageId {
-        let page_id = self.next_page_id.fetch_add(1, Ordering::Relaxed);
-        PageId(page_id)
+    pub async fn allocate_page(&self) -> Result<PageId, std::io::Error> {
+        let mut guard = self.next_page_id.lock().await;
+        let page_id = *guard.deref();
+        let at = page_id * PAGE_SIZE as u64;
+
+        let zero = Aligned::default();
+
+        // Write some data to avoid fragment
+        self.ring.write_at(&self.heap_file, &zero.0, at).await?;
+
+        *guard.deref_mut() += 1;
+
+        Ok(PageId(page_id))
     }
 
     pub async fn sync(&self) -> Result<(), std::io::Error> {
@@ -204,7 +214,7 @@ mod tests {
     async fn test_disk_manager_read_write_1() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
         let disk_manager = DiskManager::open(&path).unwrap();
-        let page_id = disk_manager.allocate_page();
+        let page_id = disk_manager.allocate_page().await.unwrap();
         let mut write_buf = Aligned::default();
 
         rand::thread_rng().fill_bytes(&mut write_buf[..]);
@@ -237,7 +247,11 @@ mod tests {
         let path = NamedTempFile::new().unwrap().into_temp_path();
         let disk_manager = DiskManager::open(&path).unwrap();
 
-        let pages: Vec<PageId> = (0..N_PAGES).map(|_| disk_manager.allocate_page()).collect();
+        let mut pages: Vec<PageId> = Vec::new();
+        for _ in 0..N_PAGES {
+            pages.push(disk_manager.allocate_page().await.unwrap());
+        }
+
         let mut memory: std::collections::HashMap<PageId, Aligned> = Default::default();
 
         let mut rng = rand::thread_rng();
