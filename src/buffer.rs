@@ -113,9 +113,14 @@ impl<T: std::fmt::Debug> BufferPool<T> {
     }
 }
 
+enum PageTableItem {
+    Read(BufferId),
+    Reading(flume::Receiver<()>),
+}
+
 struct PagePool {
     pool: BufferPool<Buffer>,
-    page_table: std::collections::HashMap<PageId, BufferId>,
+    page_table: std::collections::HashMap<PageId, PageTableItem>,
 }
 
 impl PagePool {
@@ -162,37 +167,69 @@ impl BufferPoolManager {
 
     pub async fn fetch_page(&self, page_id: PageId) -> Result<Arc<Buffer>, Error> {
         {
-            let lock = self.page_pool.read().await;
+            loop {
+                let lock = self.page_pool.read().await;
 
-            if let Some(&buffer_id) = lock.page_table.get(&page_id) {
-                let buffer = lock.pool.get(buffer_id);
-                debug_assert_eq!(buffer.page_id, page_id);
-                return Ok(buffer);
+                if let Some(page_table_item) = lock.page_table.get(&page_id) {
+                    match page_table_item {
+                        PageTableItem::Read(buffer_id) => {
+                            let buffer = lock.pool.get(*buffer_id);
+                            debug_assert_eq!(buffer.page_id, page_id);
+                            return Ok(buffer);
+                        }
+                        PageTableItem::Reading(watch) => {
+                            let watch = watch.clone();
+                            std::mem::drop(lock);
+                            let _ = watch.recv_async().await;
+                        }
+                    }
+                } else {
+                    break;
+                }
             }
         }
 
-        let mut lock = self.page_pool.write().await;
+        loop {
+            let mut lock = self.page_pool.write().await;
 
-        if let Some(&buffer_id) = lock.page_table.get(&page_id) {
-            let buffer = lock.pool.get(buffer_id);
-            debug_assert_eq!(buffer.page_id, page_id);
-            return Ok(buffer);
+            if let Some(page_table_item) = lock.page_table.get(&page_id) {
+                match page_table_item {
+                    PageTableItem::Read(buffer_id) => {
+                        let buffer = lock.pool.get(*buffer_id);
+                        debug_assert_eq!(buffer.page_id, page_id);
+                        return Ok(buffer);
+                    }
+                    PageTableItem::Reading(watch) => {
+                        let watch = watch.clone();
+                        std::mem::drop(lock);
+                        let _ = watch.recv_async().await;
+                    }
+                }
+            } else {
+                let (_tx, rx) = flume::bounded(0);
+                lock.page_table.insert(page_id, PageTableItem::Reading(rx));
+                std::mem::drop(lock);
+
+                let mut page = Aligned::default();
+                self.disk.read_page_data(page_id, &mut page).await?;
+
+                let mut lock = self.page_pool.write().await;
+
+                let buffer_id = lock.alloc_page(&self.disk).await?;
+
+                lock.page_table
+                    .insert(page_id, PageTableItem::Read(buffer_id));
+                let buffer = Buffer {
+                    page_id,
+                    page: RwLock::new(Page {
+                        is_dirty: false,
+                        page: Box::new(page),
+                    }),
+                };
+                lock.pool.insert(buffer_id, buffer);
+                return Ok(lock.pool.get(buffer_id));
+            }
         }
-
-        let buffer_id = lock.alloc_page(&self.disk).await?;
-        let mut page = Aligned::default();
-        self.disk.read_page_data(page_id, &mut page).await?;
-
-        lock.page_table.insert(page_id, buffer_id);
-        let buffer = Buffer {
-            page_id,
-            page: RwLock::new(Page {
-                is_dirty: false,
-                page: Box::new(page),
-            }),
-        };
-        lock.pool.insert(buffer_id, buffer);
-        Ok(lock.pool.get(buffer_id))
     }
 
     pub async fn create_page(&self) -> Result<Arc<Buffer>, Error> {
@@ -200,7 +237,8 @@ impl BufferPoolManager {
         let buffer_id = lock.alloc_page(&self.disk).await?;
         let page_id = self.disk.allocate_page();
 
-        lock.page_table.insert(page_id, buffer_id);
+        lock.page_table
+            .insert(page_id, PageTableItem::Read(buffer_id));
         let buffer = Buffer {
             page_id,
             page: RwLock::new(Page {
@@ -217,11 +255,13 @@ impl Drop for BufferPoolManager {
     fn drop(&mut self) {
         futures::executor::block_on(async {
             let lock = self.page_pool.read().await;
-            for (&page_id, &buffer_id) in lock.page_table.iter() {
-                let buffer = lock.pool.get(buffer_id);
-                let lock = buffer.page.read().await;
-                if lock.is_dirty {
-                    self.disk.write_page_data(page_id, &lock).await.unwrap();
+            for (&page_id, page_table_item) in lock.page_table.iter() {
+                if let PageTableItem::Read(buffer_id) = page_table_item {
+                    let buffer = lock.pool.get(*buffer_id);
+                    let lock = buffer.page.read().await;
+                    if lock.is_dirty {
+                        self.disk.write_page_data(page_id, &lock).await.unwrap();
+                    }
                 }
             }
         });

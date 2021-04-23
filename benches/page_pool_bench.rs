@@ -30,16 +30,19 @@ fn criterion_benchmark(c: &mut Criterion) {
                         for _ in 0usize..4 {
                             pages.shuffle(&mut rng);
                             for &page_id in &pages {
-                                let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
-                                rng.fill_bytes(
-                                    buffer
-                                        .page
-                                        .write()
-                                        .await
-                                        .deref_mut()
-                                        .deref_mut()
-                                        .deref_mut(),
-                                );
+                                for _ in 0..2 {
+                                    let buffer =
+                                        buffer_pool_manager.fetch_page(page_id).await.unwrap();
+                                    rng.fill_bytes(
+                                        buffer
+                                            .page
+                                            .write()
+                                            .await
+                                            .deref_mut()
+                                            .deref_mut()
+                                            .deref_mut(),
+                                    );
+                                }
                             }
                         }
                     })
