@@ -314,7 +314,7 @@ impl Drop for BufferPoolManager {
                         self.disk.write_page_data(page_id, &lock).await.unwrap();
                     }
                 } else {
-                    panic!("Found PageTableItem::Reading variant while dropping. This is a bug!");
+                    panic!("Found PageTableItem::Reading/Writing variant while dropping. This is a bug!");
                 }
             }
         });
