@@ -1,7 +1,7 @@
 use crate::disk::Aligned;
 use crate::disk::DiskManager;
 use crate::disk::PageId;
-use async_rwlock::RwLock;
+use async_rwlock::{RwLock, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     ops::{Deref, DerefMut},
@@ -37,11 +37,13 @@ pub struct Buffer {
     pub page: RwLock<Page>,
 }
 
+#[derive(Debug)]
 struct Frame<T> {
     usage_count: AtomicU64,
     buffer: Arc<T>,
 }
 
+#[derive(Debug)]
 struct BufferPool<T> {
     buffers: Vec<Option<Frame<T>>>,
     next_victim_id: BufferId,
@@ -102,6 +104,10 @@ impl<T: std::fmt::Debug> BufferPool<T> {
         });
     }
 
+    fn remove(&mut self, buffer_id: BufferId) {
+        self.buffers[buffer_id.0] = None;
+    }
+
     fn size(&self) -> usize {
         self.buffers.len()
     }
@@ -113,32 +119,18 @@ impl<T: std::fmt::Debug> BufferPool<T> {
     }
 }
 
+#[derive(Debug)]
 enum PageTableItem {
     Read(BufferId),
+    // We can merge Reading/Writing variant but keep separated for debug purpose.
     Reading(flume::Receiver<()>),
+    Writing(flume::Receiver<()>),
 }
 
+#[derive(Debug)]
 struct PagePool {
     pool: BufferPool<Buffer>,
     page_table: std::collections::HashMap<PageId, PageTableItem>,
-}
-
-impl PagePool {
-    async fn alloc_page(&mut self, disk: &DiskManager) -> Result<BufferId, Error> {
-        let (buffer_id, prev_buffer) = self.pool.evict().ok_or(Error::NoFreeBuffer)?;
-        if let Some(prev_buffer) = prev_buffer {
-            let lock = prev_buffer.page.read().await;
-            if lock.is_dirty {
-                if let Err(err) = disk.write_page_data(prev_buffer.page_id, &lock).await {
-                    std::mem::drop(lock);
-                    self.pool.insert(buffer_id, prev_buffer);
-                    return Err(err.into());
-                }
-            }
-            self.page_table.remove(&prev_buffer.page_id);
-        }
-        Ok(buffer_id)
-    }
 }
 
 pub struct BufferPoolManager {
@@ -165,6 +157,47 @@ impl BufferPoolManager {
         }
     }
 
+    async fn alloc_page(&self) -> Result<(BufferId, RwLockWriteGuard<'_, PagePool>), Error> {
+        let mut lock = self.page_pool.write().await;
+        let (buffer_id, prev_buffer) = lock.pool.evict().ok_or(Error::NoFreeBuffer)?;
+
+        let lock = if let Some(prev_buffer) = prev_buffer {
+            let buffer_lock = prev_buffer.page.read().await;
+            if buffer_lock.is_dirty {
+                std::mem::drop(buffer_lock);
+                let (_tx, rx) = flume::bounded(0);
+                lock.page_table
+                    .insert(prev_buffer.page_id, PageTableItem::Writing(rx));
+                lock.pool.insert(buffer_id, prev_buffer);
+                let prev_buffer = lock.pool.get(buffer_id);
+                std::mem::drop(lock);
+                let buffer_lock = prev_buffer.page.read().await;
+                if let Err(err) = self
+                    .disk
+                    .write_page_data(prev_buffer.page_id, &buffer_lock)
+                    .await
+                {
+                    std::mem::drop(buffer_lock);
+                    let mut lock = self.page_pool.write().await;
+                    lock.page_table
+                        .insert(prev_buffer.page_id, PageTableItem::Read(buffer_id));
+                    return Err(err.into());
+                }
+                let mut lock = self.page_pool.write().await;
+                lock.page_table.remove(&prev_buffer.page_id);
+                lock.pool.remove(buffer_id);
+                lock
+            } else {
+                lock.page_table.remove(&prev_buffer.page_id);
+                lock
+            }
+        } else {
+            lock
+        };
+
+        Ok((buffer_id, lock))
+    }
+
     pub async fn fetch_page(&self, page_id: PageId) -> Result<Arc<Buffer>, Error> {
         {
             loop {
@@ -178,6 +211,11 @@ impl BufferPoolManager {
                             return Ok(buffer);
                         }
                         PageTableItem::Reading(watch) => {
+                            let watch = watch.clone();
+                            std::mem::drop(lock);
+                            let _ = watch.recv_async().await;
+                        }
+                        PageTableItem::Writing(watch) => {
                             let watch = watch.clone();
                             std::mem::drop(lock);
                             let _ = watch.recv_async().await;
@@ -204,6 +242,11 @@ impl BufferPoolManager {
                         std::mem::drop(lock);
                         let _ = watch.recv_async().await;
                     }
+                    PageTableItem::Writing(watch) => {
+                        let watch = watch.clone();
+                        std::mem::drop(lock);
+                        let _ = watch.recv_async().await;
+                    }
                 }
             } else {
                 let (_tx, rx) = flume::bounded(0);
@@ -217,13 +260,12 @@ impl BufferPoolManager {
                     return Err(err.into());
                 }
 
-                let mut lock = self.page_pool.write().await;
-
-                let buffer_id = match lock.alloc_page(&self.disk).await {
-                    Ok(buffer_id) => buffer_id,
+                let (buffer_id, mut lock) = match self.alloc_page().await {
+                    Ok(ret) => ret,
                     Err(err) => {
+                        let mut lock = self.page_pool.write().await;
                         lock.page_table.remove(&page_id);
-                        return Err(err.into());
+                        return Err(err);
                     }
                 };
 
@@ -243,16 +285,15 @@ impl BufferPoolManager {
     }
 
     pub async fn create_page(&self) -> Result<Arc<Buffer>, Error> {
-        let mut lock = self.page_pool.write().await;
-        let buffer_id = lock.alloc_page(&self.disk).await?;
-        let page_id = self.disk.allocate_page();
+        let (buffer_id, mut lock) = self.alloc_page().await?;
+        let page_id = self.disk.allocate_page().await?;
 
         lock.page_table
             .insert(page_id, PageTableItem::Read(buffer_id));
         let buffer = Buffer {
             page_id,
             page: RwLock::new(Page {
-                is_dirty: true,
+                is_dirty: false,
                 page: Default::default(),
             }),
         };
@@ -313,6 +354,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_buffer_pool_manager_single() {
+        const N_PAGES: usize = 64;
+        const POOL_SIZE: usize = 1;
+        const N_ITER: u8 = 16;
+
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+        let mut pages = Vec::new();
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
+
+        for _ in 0..N_PAGES {
+            pages.push(buffer_pool_manager.create_page().await.unwrap().page_id);
+        }
+
+        {
+            let buffer_pool_manager = buffer_pool_manager;
+
+            let mut rng = StdRng::from_entropy();
+            for v in 1..=N_ITER {
+                pages.shuffle(&mut rng);
+                for &page_id in &pages {
+                    let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
+                    assert_eq!(page_id, buffer.page_id);
+                    let mut lock = buffer.page.write().await;
+                    lock.fill(v);
+                }
+            }
+        }
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
+        for page_id in pages {
+            let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
+            assert!(buffer.page.read().await.iter().all(|&v| v == N_ITER));
+        }
+    }
+
+    #[tokio::test]
     async fn test_buffer_pool_manager_concurrent() {
         const N_PAGES: usize = 64;
         const POOL_SIZE: usize = 4;
@@ -334,7 +412,7 @@ mod tests {
             let buffer_pool_manager = Arc::new(buffer_pool_manager);
 
             let v = pages
-                .chunks(POOL_SIZE)
+                .chunks(N_PAGES / POOL_SIZE)
                 .map(|page_ids| {
                     let mut page_ids = page_ids.to_vec();
                     let buffer_pool_manager = buffer_pool_manager.clone();
