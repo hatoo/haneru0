@@ -285,8 +285,8 @@ impl BufferPoolManager {
     }
 
     pub async fn create_page(&self) -> Result<Arc<Buffer>, Error> {
-        let page_id = self.disk.allocate_page().await?;
         let (buffer_id, mut lock) = self.alloc_page().await?;
+        let page_id = self.disk.allocate_page().await?;
 
         lock.page_table
             .insert(page_id, PageTableItem::Read(buffer_id));
