@@ -134,7 +134,11 @@ impl DiskManager {
         page_id: PageId,
         data: &Aligned,
     ) -> Result<(), std::io::Error> {
-        debug_assert!(page_id.0 < *self.next_page_id.lock().await.deref());
+        debug_assert!(self
+            .next_page_id
+            .try_lock()
+            .map(|guard| page_id.0 < *guard.deref())
+            .unwrap_or(true));
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = loop {
@@ -182,12 +186,11 @@ impl DiskManager {
     pub async fn allocate_page(&self) -> Result<PageId, std::io::Error> {
         let mut guard = self.next_page_id.lock().await;
         let page_id = *guard.deref();
-        let at = page_id * PAGE_SIZE as u64;
 
         let zero = Aligned::default();
 
         // Write some data to avoid fragment
-        self.ring.write_at(&self.heap_file, &zero.0, at).await?;
+        self.write_page_data(PageId(page_id), &zero).await?;
 
         *guard.deref_mut() += 1;
 
