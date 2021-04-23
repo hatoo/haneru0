@@ -183,18 +183,24 @@ impl DiskManager {
         Ok(())
     }
 
-    pub async fn allocate_page(&self) -> Result<PageId, std::io::Error> {
+    pub async fn allocate_page(
+        &self,
+    ) -> (
+        PageId,
+        impl '_ + std::future::Future<Output = Result<(), std::io::Error>>,
+    ) {
         let mut guard = self.next_page_id.lock().await;
         let page_id = *guard.deref();
 
-        let zero = Aligned::default();
+        (PageId(page_id), async move {
+            let zero = Aligned::default();
 
-        // Write some data to avoid fragment
-        self.write_page_data(PageId(page_id), &zero).await?;
+            // Write some data to avoid fragment
+            self.write_page_data(PageId(page_id), &zero).await?;
 
-        *guard.deref_mut() += 1;
-
-        Ok(PageId(page_id))
+            *guard.deref_mut() += 1;
+            Ok(())
+        })
     }
 
     pub async fn sync(&self) -> Result<(), std::io::Error> {
@@ -217,7 +223,8 @@ mod tests {
     async fn test_disk_manager_read_write_1() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
         let disk_manager = DiskManager::open(&path).unwrap();
-        let page_id = disk_manager.allocate_page().await.unwrap();
+        let (page_id, f) = disk_manager.allocate_page().await;
+        f.await.unwrap();
         let mut write_buf = Aligned::default();
 
         rand::thread_rng().fill_bytes(&mut write_buf[..]);
@@ -252,7 +259,9 @@ mod tests {
 
         let mut pages: Vec<PageId> = Vec::new();
         for _ in 0..N_PAGES {
-            pages.push(disk_manager.allocate_page().await.unwrap());
+            let (page_id, f) = disk_manager.allocate_page().await;
+            f.await.unwrap();
+            pages.push(page_id);
         }
 
         let mut memory: std::collections::HashMap<PageId, Aligned> = Default::default();
