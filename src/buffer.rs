@@ -286,28 +286,20 @@ impl BufferPoolManager {
 
     pub async fn create_page(&self) -> Result<Arc<Buffer>, Error> {
         let (buffer_id, mut lock) = self.alloc_page().await?;
-        let (page_id, f) = self.disk.allocate_page().await;
+        let page_id = self.disk.allocate_page();
+        lock.page_table
+            .insert(page_id, PageTableItem::Read(buffer_id));
         lock.pool.insert(
             buffer_id,
             Buffer {
                 page_id,
-                page: Default::default(),
+                page: RwLock::new(Page {
+                    is_dirty: true,
+                    page: Default::default(),
+                }),
             },
         );
-        let buffer = lock.pool.get(buffer_id);
-        std::mem::drop(lock);
-
-        if let Err(err) = f.await {
-            let mut lock = self.page_pool.write().await;
-            lock.pool.remove(buffer_id);
-            return Err(err.into());
-        }
-
-        let mut lock = self.page_pool.write().await;
-
-        lock.page_table
-            .insert(page_id, PageTableItem::Read(buffer_id));
-        Ok(buffer)
+        Ok(lock.pool.get(buffer_id))
     }
 }
 
