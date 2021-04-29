@@ -134,18 +134,7 @@ impl DiskManager {
         page_id: PageId,
         data: &Aligned,
     ) -> Result<(), std::io::Error> {
-        self.my_write_page_data(page_id, data, false).await
-    }
-
-    async fn my_write_page_data(
-        &self,
-        page_id: PageId,
-        data: &Aligned,
-        for_create: bool,
-    ) -> Result<(), std::io::Error> {
-        if !for_create {
-            debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
-        }
+        debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = loop {
