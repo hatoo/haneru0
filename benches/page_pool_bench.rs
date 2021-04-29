@@ -99,6 +99,35 @@ fn criterion_benchmark(c: &mut Criterion) {
             }
         })
     });
+
+    c.bench_function("pool_manager_create", |b| {
+        b.to_async(&rt).iter(|| async {
+            use haneru::buffer::BufferPoolManager;
+            use haneru::disk::DiskManager;
+            use std::sync::Arc;
+            use tempfile::NamedTempFile;
+
+            let path = NamedTempFile::new().unwrap().into_temp_path();
+
+            let disk_manager = DiskManager::open(&path).unwrap();
+            let buffer_pool_manager = BufferPoolManager::new(disk_manager, 4);
+
+            let buffer_pool_manager = Arc::new(buffer_pool_manager);
+            let v = (0..4)
+                .map(|_| {
+                    let buffer_pool_manager = buffer_pool_manager.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..16 {
+                            buffer_pool_manager.create_page().await.unwrap();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for f in v {
+                f.await.unwrap();
+            }
+        })
+    });
 }
 
 criterion_group!(benches, criterion_benchmark);
