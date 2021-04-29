@@ -143,13 +143,9 @@ impl DiskManager {
         data: &Aligned,
         for_create: bool,
     ) -> Result<(), std::io::Error> {
-        let _write_lock = if !for_create {
-            let lock = self.next_page_id.read().await;
-            debug_assert!(page_id.0 < *lock.deref());
-            Some(lock)
-        } else {
-            None
-        };
+        if !for_create {
+            debug_assert!(page_id.0 < *self.next_page_id.read().await);
+        }
 
         let at = page_id.0 * PAGE_SIZE as u64;
         let mut written_len = loop {
