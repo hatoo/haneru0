@@ -52,10 +52,7 @@ struct BufferPool<T> {
 impl<T: std::fmt::Debug> BufferPool<T> {
     fn new(pool_size: usize) -> Self {
         assert!(pool_size > 0);
-        let mut buffers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            buffers.push(None);
-        }
+        let buffers = (0..pool_size).map(|_| None).collect();
         Self {
             buffers,
             next_victim_id: BufferId(0),
