@@ -302,20 +302,20 @@ impl BufferPoolManager {
 
 impl Drop for BufferPoolManager {
     fn drop(&mut self) {
-        futures::executor::block_on(async {
-            let lock = self.page_pool.read().await;
-            for (&page_id, page_table_item) in lock.page_table.iter() {
-                if let PageTableItem::Read(buffer_id) = page_table_item {
-                    let buffer = lock.pool.get(*buffer_id);
-                    let lock = buffer.page.read().await;
-                    if lock.is_dirty {
-                        self.disk.write_page_data(page_id, &lock).await.unwrap();
-                    }
-                } else {
-                    panic!("Found PageTableItem::Reading/Writing variant while dropping. This is a bug!");
+        let lock = self.page_pool.try_read().unwrap();
+        for (&page_id, page_table_item) in lock.page_table.iter() {
+            if let PageTableItem::Read(buffer_id) = page_table_item {
+                let buffer = lock.pool.get(*buffer_id);
+                let lock = buffer.page.try_read().unwrap();
+                if lock.is_dirty {
+                    self.disk.write_page_data_sync(page_id, &lock).unwrap();
                 }
+            } else {
+                panic!(
+                    "Found PageTableItem::Reading/Writing variant while dropping. This is a bug!"
+                );
             }
-        });
+        }
     }
 }
 

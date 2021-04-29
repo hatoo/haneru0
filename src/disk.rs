@@ -179,6 +179,56 @@ impl DiskManager {
         Ok(())
     }
 
+    pub(crate) fn write_page_data_sync(
+        &self,
+        page_id: PageId,
+        data: &Aligned,
+    ) -> Result<(), std::io::Error> {
+        debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+
+        let at = page_id.0 * PAGE_SIZE as u64;
+        let mut written_len = loop {
+            match self.ring.write_at(&self.heap_file, &data.0, at).wait() {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ))
+                }
+                Ok(n) => break n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        };
+        while written_len < PAGE_SIZE {
+            let mut buf = Aligned::default();
+            buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
+            written_len += loop {
+                match self
+                    .ring
+                    .write_at(
+                        &self.heap_file,
+                        &buf[..PAGE_SIZE - written_len].as_ref(),
+                        at + written_len as u64,
+                    )
+                    .wait()
+                {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        ))
+                    }
+                    Ok(n) => break n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+        }
+
+        Ok(())
+    }
+
     pub fn allocate_page(&self) -> PageId {
         PageId(self.next_page_id.fetch_add(1, Ordering::Relaxed))
     }
