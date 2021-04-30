@@ -34,6 +34,7 @@ struct Header {
     first_freed_block_offset: u16,
 }
 
+// We can't use `zerocopy` for this struct since this may not be aligned.
 struct FreedBlock {
     len: u16,
     // 0 if tail
@@ -216,7 +217,7 @@ impl<B: ByteSliceMut> Slotted<B> {
             .min_by_key(|b| b.pointer.len)
         {
             let pointer = Pointer {
-                offset: freed_pointer.pointer.offset,
+                offset: freed_pointer.pointer.offset + freed_pointer.pointer.len - len as u16,
                 len: len as u16,
             };
 
@@ -225,17 +226,9 @@ impl<B: ByteSliceMut> Slotted<B> {
             let rest_len = freed_pointer.pointer.len as usize - len;
 
             if rest_len >= size_of::<FreedBlock>() {
-                let offset = freed_pointer.pointer.offset + len as u16;
+                let offset = freed_pointer.pointer.offset;
                 let next_freed_block_offset = freed_pointer.next_freed_block_offset;
 
-                if freed_pointer.prev_freed_block_offset == 0 {
-                    self.header.first_freed_block_offset = offset;
-                } else {
-                    FreedBlock::write_next_freed_offset(
-                        &mut self.body[freed_pointer.prev_freed_block_offset as usize..],
-                        offset,
-                    );
-                }
                 FreedBlock {
                     len: rest_len as u16,
                     next_freed_block_offset,
