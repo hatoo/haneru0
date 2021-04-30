@@ -154,8 +154,12 @@ impl BufferPoolManager {
         }
     }
 
-    async fn alloc_page(&self) -> Result<(BufferId, RwLockWriteGuard<'_, PagePool>), Error> {
-        let mut lock = self.page_pool.write().await;
+    async fn alloc_page<'a>(
+        &'a self,
+        lock: RwLockWriteGuard<'a, PagePool>,
+    ) -> Result<(BufferId, RwLockWriteGuard<'a, PagePool>), Error> {
+        let mut lock = lock;
+
         let (buffer_id, prev_buffer) = lock.pool.evict().ok_or(Error::NoFreeBuffer)?;
 
         let lock = if let Some(prev_buffer) = prev_buffer {
@@ -220,7 +224,7 @@ impl BufferPoolManager {
         }
 
         loop {
-            let mut lock = self.page_pool.write().await;
+            let lock = self.page_pool.write().await;
 
             if let Some(page_table_item) = lock.page_table.get(&page_id) {
                 match page_table_item {
@@ -236,43 +240,44 @@ impl BufferPoolManager {
                     }
                 }
             } else {
-                let (_tx, rx) = flume::bounded(0);
-                lock.page_table.insert(page_id, PageTableItem::Reading(rx));
-                std::mem::drop(lock);
-
-                let mut page = Aligned::default();
-                if let Err(err) = self.disk.read_page_data(page_id, &mut page).await {
-                    let mut lock = self.page_pool.write().await;
-                    lock.page_table.remove(&page_id);
-                    return Err(err.into());
-                }
-
-                let (buffer_id, mut lock) = match self.alloc_page().await {
+                let (buffer_id, mut lock) = match self.alloc_page(lock).await {
                     Ok(ret) => ret,
                     Err(err) => {
-                        let mut lock = self.page_pool.write().await;
-                        lock.page_table.remove(&page_id);
                         return Err(err);
                     }
                 };
+                let (_tx, rx) = flume::bounded(0);
+                lock.page_table.insert(page_id, PageTableItem::Reading(rx));
+                lock.pool.insert(
+                    buffer_id,
+                    Buffer {
+                        page_id,
+                        page: Default::default(),
+                    },
+                );
+                let buffer = lock.pool.get(buffer_id);
+                std::mem::drop(lock);
+
+                let mut page = buffer.page.write().await;
+                if let Err(err) = self.disk.read_page_data(page_id, &mut page).await {
+                    let mut lock = self.page_pool.write().await;
+                    lock.page_table.remove(&page_id);
+                    lock.pool.remove(buffer_id);
+                    return Err(err.into());
+                }
+                std::mem::drop(page);
+
+                let mut lock = self.page_pool.write().await;
 
                 lock.page_table
                     .insert(page_id, PageTableItem::Read(buffer_id));
-                let buffer = Buffer {
-                    page_id,
-                    page: RwLock::new(Page {
-                        is_dirty: false,
-                        page: Box::new(page),
-                    }),
-                };
-                lock.pool.insert(buffer_id, buffer);
-                return Ok(lock.pool.get(buffer_id));
+                return Ok(buffer);
             }
         }
     }
 
     pub async fn create_page(&self) -> Result<Arc<Buffer>, Error> {
-        let (buffer_id, mut lock) = self.alloc_page().await?;
+        let (buffer_id, mut lock) = self.alloc_page(self.page_pool.write().await).await?;
         let page_id = self.disk.allocate_page();
         lock.page_table
             .insert(page_id, PageTableItem::Read(buffer_id));
