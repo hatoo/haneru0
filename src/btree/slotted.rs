@@ -221,8 +221,6 @@ impl<B: ByteSliceMut> Slotted<B> {
                 len: len as u16,
             };
 
-            dbg!(self.freed_blocks().collect::<Vec<_>>());
-
             let rest_len = freed_pointer.pointer.len as usize - len;
 
             if rest_len >= size_of::<FreedBlock>() {
@@ -420,11 +418,10 @@ mod tests {
 
         for _ in 0..4096 {
             let p: f32 = rng.gen();
-            dbg!(slotted.pointers());
             match p {
                 _ if p < 0.25 => {
                     let mut buf = vec![0u8; rng.gen_range(0..32)];
-                    rng.fill_bytes(buf.as_bytes_mut());
+                    rng.fill_bytes(buf.as_mut_slice());
 
                     if slotted.free_capacity() >= buf.len() + size_of::<Pointer>() {
                         push(&mut slotted, buf.as_slice());
@@ -435,7 +432,7 @@ mod tests {
                     if memory.len() > 0 {
                         let i = rng.gen_range(0..memory.len());
                         let mut buf = vec![0u8; rng.gen_range(0..32)];
-                        rng.fill_bytes(buf.as_bytes_mut());
+                        rng.fill_bytes(buf.as_mut_slice());
 
                         if slotted.free_capacity() >= buf.len() + size_of::<Pointer>() {
                             insert(&mut slotted, i, buf.as_slice());
@@ -447,7 +444,7 @@ mod tests {
                     if memory.len() > 0 {
                         let i = rng.gen_range(0..memory.len());
                         let mut buf = vec![0u8; rng.gen_range(0..32)];
-                        rng.fill_bytes(buf.as_bytes_mut());
+                        rng.fill_bytes(buf.as_mut_slice());
 
                         if slotted.free_capacity() as isize
                             >= buf.len() as isize - memory[i].len() as isize

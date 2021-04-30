@@ -27,3 +27,7 @@ criterion = { version="0.3", features = ["async_tokio"] }
 [[bench]]
 name = "page_pool_bench"
 harness = false
+
+[[bench]]
+name = "slotted_page_bench"
+harness = false
