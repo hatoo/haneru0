@@ -207,12 +207,7 @@ impl BufferPoolManager {
                             debug_assert_eq!(buffer.page_id, page_id);
                             return Ok(buffer);
                         }
-                        PageTableItem::Reading(watch) => {
-                            let watch = watch.clone();
-                            std::mem::drop(lock);
-                            let _ = watch.recv_async().await;
-                        }
-                        PageTableItem::Writing(watch) => {
+                        PageTableItem::Reading(watch) | PageTableItem::Writing(watch) => {
                             let watch = watch.clone();
                             std::mem::drop(lock);
                             let _ = watch.recv_async().await;
@@ -234,12 +229,7 @@ impl BufferPoolManager {
                         debug_assert_eq!(buffer.page_id, page_id);
                         return Ok(buffer);
                     }
-                    PageTableItem::Reading(watch) => {
-                        let watch = watch.clone();
-                        std::mem::drop(lock);
-                        let _ = watch.recv_async().await;
-                    }
-                    PageTableItem::Writing(watch) => {
+                    PageTableItem::Reading(watch) | PageTableItem::Writing(watch) => {
                         let watch = watch.clone();
                         std::mem::drop(lock);
                         let _ = watch.recv_async().await;
