@@ -92,6 +92,10 @@ impl FreedBlock {
     fn write_next_freed_offset(bytes: &mut [u8], next_freed_offset: u16) {
         NativeEndian::write_u16(&mut bytes[2..4], next_freed_offset);
     }
+
+    fn write_len(bytes: &mut [u8], len: u16) {
+        NativeEndian::write_u16(&mut bytes[0..2], len);
+    }
 }
 
 impl<'a, B: ByteSlice> Iterator for FreedBlockIter<'a, B> {
@@ -180,26 +184,23 @@ impl<B: ByteSliceMut> Slotted<B> {
     }
 
     fn defrag(&mut self) {
-        let pointers: Vec<(usize, Pointer)> = {
-            let mut pointers: Vec<(usize, Pointer)> =
-                self.pointers().iter().cloned().enumerate().collect();
-            pointers.sort_by_key(|(_, p)| (std::cmp::Reverse(p.offset), std::cmp::Reverse(p.len)));
-            pointers
-        };
-
-        debug_assert!(pointers
-            .windows(2)
-            .all(|w| { w[1].1.offset + w[1].1.len <= w[0].1.offset }));
-
         let mut free_space_offset = self.body.len();
-
-        for (i, pointer) in pointers {
-            self.body
-                .copy_within(pointer.range(), free_space_offset - pointer.len as usize);
-            self.pointers_mut()[i].offset = free_space_offset as u16 - pointer.len;
-
+        let ptr_offset = size_of::<Pointer>() * self.num_slots();
+        let mut buf = vec![0u8; self.body.len() - ptr_offset];
+        let (pointers, body) = self.body.split_at_mut(ptr_offset);
+        let mut pointers = Pointers::new_slice(pointers).unwrap();
+        for pointer in pointers.iter_mut() {
+            buf[free_space_offset - pointer.len as usize - ptr_offset
+                ..free_space_offset - ptr_offset]
+                .copy_from_slice(
+                    &body[pointer.offset as usize - ptr_offset
+                        ..pointer.offset as usize - ptr_offset + pointer.len as usize],
+                );
             free_space_offset -= pointer.len as usize;
+            pointer.offset = free_space_offset as u16;
         }
+        body[free_space_offset - ptr_offset..]
+            .copy_from_slice(&buf[free_space_offset - ptr_offset..]);
 
         self.header.free_space_offset = free_space_offset as u16;
         debug_assert_eq!(
@@ -225,13 +226,7 @@ impl<B: ByteSliceMut> Slotted<B> {
 
             if rest_len >= size_of::<FreedBlock>() {
                 let offset = freed_pointer.pointer.offset;
-                let next_freed_block_offset = freed_pointer.next_freed_block_offset;
-
-                FreedBlock {
-                    len: rest_len as u16,
-                    next_freed_block_offset,
-                }
-                .write(&mut self.body[offset as usize..]);
+                FreedBlock::write_len(&mut self.body[offset as usize..], rest_len as u16);
             } else {
                 if freed_pointer.prev_freed_block_offset == 0 {
                     self.header.first_freed_block_offset = freed_pointer.next_freed_block_offset;
