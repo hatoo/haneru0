@@ -69,7 +69,7 @@ struct FreedBlockIter<'a, B> {
     current: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct FreedPointer {
     pointer: Pointer,
     prev_freed_block_offset: u16,
@@ -180,9 +180,11 @@ impl<B: ByteSliceMut> Slotted<B> {
             pointers
         };
 
+        /*
         debug_assert!(pointers
             .windows(2)
             .all(|w| { w[1].1.offset + w[1].1.len <= w[0].1.offset }));
+            */
 
         let mut free_space_offset = self.body.len();
 
@@ -276,10 +278,80 @@ impl<B: ByteSliceMut> Slotted<B> {
 
     fn remove_block(&mut self, index: usize) {
         let pointer = self.pointers()[index];
-        if let Some(mut freed_block) = FreedBlock::new(&mut self.body[pointer.range()]) {
-            freed_block.len = pointer.len;
-            freed_block.next_freed_block_offset = self.header.first_freed_block_offset;
-            self.header.first_freed_block_offset = pointer.offset;
+
+        let mut left = None;
+        let mut right = None;
+
+        for f in self.freed_blocks() {
+            if f.pointer.offset + f.pointer.len == pointer.offset {
+                left = Some(f);
+            }
+            if pointer.offset + pointer.len == f.pointer.offset {
+                right = Some(f);
+            }
+        }
+
+        match (left, right) {
+            (Some(left), Some(mut right)) => {
+                if left.prev_freed_block_offset == 0 {
+                    self.header.first_freed_block_offset = left.next_freed_block_offset;
+                } else {
+                    let mut left_prev_block =
+                        FreedBlock::new(&mut self.body[left.prev_freed_block_offset as usize..])
+                            .unwrap();
+                    left_prev_block.next_freed_block_offset = left.next_freed_block_offset;
+                }
+
+                if right.prev_freed_block_offset == left.pointer.offset {
+                    right.prev_freed_block_offset = left.prev_freed_block_offset;
+                }
+
+                if right.next_freed_block_offset == left.pointer.offset {
+                    right.next_freed_block_offset = left.next_freed_block_offset;
+                }
+
+                if right.prev_freed_block_offset == 0 {
+                    self.header.first_freed_block_offset = right.next_freed_block_offset;
+                } else {
+                    let mut right_prev_block =
+                        FreedBlock::new(&mut self.body[right.prev_freed_block_offset as usize..])
+                            .unwrap();
+                    right_prev_block.next_freed_block_offset = right.next_freed_block_offset;
+                }
+
+                let mut new_block =
+                    FreedBlock::new(&mut self.body[left.pointer.offset as usize..]).unwrap();
+
+                new_block.len = left.pointer.len + pointer.len + right.pointer.len;
+                new_block.next_freed_block_offset = self.header.first_freed_block_offset;
+                self.header.first_freed_block_offset = left.pointer.offset;
+            }
+            (Some(left), None) => {
+                let mut left_block =
+                    FreedBlock::new(&mut self.body[left.pointer.offset as usize..]).unwrap();
+                left_block.len += pointer.len;
+            }
+            (None, Some(right)) => {
+                let mut new_block =
+                    FreedBlock::new(&mut self.body[pointer.offset as usize..]).unwrap();
+                new_block.len = pointer.len + right.pointer.len;
+                new_block.next_freed_block_offset = right.next_freed_block_offset;
+                if right.prev_freed_block_offset == 0 {
+                    self.header.first_freed_block_offset = pointer.offset;
+                } else {
+                    let mut right_prev_block =
+                        FreedBlock::new(&mut self.body[right.prev_freed_block_offset as usize..])
+                            .unwrap();
+                    right_prev_block.next_freed_block_offset = pointer.offset;
+                }
+            }
+            (None, None) => {
+                if let Some(mut freed_block) = FreedBlock::new(&mut self.body[pointer.range()]) {
+                    freed_block.len = pointer.len;
+                    freed_block.next_freed_block_offset = self.header.first_freed_block_offset;
+                    self.header.first_freed_block_offset = pointer.offset;
+                }
+            }
         }
     }
 
@@ -459,6 +531,7 @@ mod tests {
                     }
                 }
             }
+            dbg!(slotted.freed_blocks().collect::<Vec<_>>());
             assert_eq!(slotted.num_slots(), memory.len());
             for (i, buf) in memory.iter().enumerate() {
                 assert_eq!(&slotted[i], buf.as_slice());
