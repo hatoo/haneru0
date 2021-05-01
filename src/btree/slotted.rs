@@ -175,7 +175,7 @@ impl<B: ByteSliceMut> Slotted<B> {
     fn defrag(&mut self) {
         let pointers: Vec<(usize, Pointer)> = {
             let mut pointers: Vec<(usize, Pointer)> =
-                self.pointers().iter().cloned().enumerate().collect();
+                self.pointers().iter().copied().enumerate().collect();
             pointers.sort_by_key(|(_, p)| (std::cmp::Reverse(p.offset), std::cmp::Reverse(p.len)));
             pointers
         };
