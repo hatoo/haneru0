@@ -16,12 +16,12 @@ fn criterion_benchmark(c: &mut Criterion) {
                 match p {
                     _ if p < 0.50 => {
                         let index = rng.gen_range(0..=slotted.num_slots());
-                        slotted.insert(index, rng.gen_range(0..256));
+                        slotted.insert(index, rng.gen_range(0..32));
                     }
                     _ if p < 0.75 => {
                         if slotted.num_slots() > 0 {
                             let index = rng.gen_range(0..slotted.num_slots());
-                            slotted.resize(index, rng.gen_range(0..256));
+                            slotted.resize(index, rng.gen_range(0..32));
                         }
                     }
                     _ => {
@@ -220,12 +220,12 @@ fn criterion_benchmark(c: &mut Criterion) {
                 match p {
                     _ if p < 0.50 => {
                         let index = rng.gen_range(0..=slotted.num_slots());
-                        slotted.insert(index, rng.gen_range(0..256));
+                        slotted.insert(index, rng.gen_range(0..32));
                     }
                     _ if p < 0.75 => {
                         if slotted.num_slots() > 0 {
                             let index = rng.gen_range(0..slotted.num_slots());
-                            slotted.resize(index, rng.gen_range(0..256));
+                            slotted.resize(index, rng.gen_range(0..32));
                         }
                     }
                     _ => {
