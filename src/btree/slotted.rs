@@ -18,11 +18,13 @@
 /// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 /// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
 /// OR OTHER DEALINGS IN THE SOFTWARE.
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::ops::{Index, IndexMut, Range};
 
 use byteorder::{ByteOrder, NativeEndian};
 use zerocopy::{AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified};
+
+use crate::disk::PAGE_SIZE;
 
 #[derive(Debug, FromBytes, AsBytes)]
 #[repr(C)]
@@ -126,6 +128,7 @@ impl<B: ByteSlice> Slotted<B> {
     pub fn new(bytes: B) -> Self {
         let (header, body) =
             LayoutVerified::new_from_prefix(bytes).expect("slotted header must be aligned");
+        assert!(body.len() <= PAGE_SIZE);
         Self { header, body }
     }
 
@@ -184,23 +187,21 @@ impl<B: ByteSliceMut> Slotted<B> {
     }
 
     fn defrag(&mut self) {
-        let mut free_space_offset = self.body.len();
+        let body_len = self.body.len();
+        let mut free_space_offset = body_len;
         let ptr_offset = size_of::<Pointer>() * self.num_slots();
-        let mut buf = vec![0u8; self.body.len() - ptr_offset];
+        let mut buf: [u8; PAGE_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
         let (pointers, body) = self.body.split_at_mut(ptr_offset);
         let mut pointers = Pointers::new_slice(pointers).unwrap();
         for pointer in pointers.iter_mut() {
-            buf[free_space_offset - pointer.len as usize - ptr_offset
-                ..free_space_offset - ptr_offset]
-                .copy_from_slice(
-                    &body[pointer.offset as usize - ptr_offset
-                        ..pointer.offset as usize - ptr_offset + pointer.len as usize],
-                );
+            buf[free_space_offset - pointer.len as usize..free_space_offset].copy_from_slice(
+                &body[pointer.offset as usize - ptr_offset
+                    ..pointer.offset as usize - ptr_offset + pointer.len as usize],
+            );
             free_space_offset -= pointer.len as usize;
             pointer.offset = free_space_offset as u16;
         }
-        body[free_space_offset - ptr_offset..]
-            .copy_from_slice(&buf[free_space_offset - ptr_offset..]);
+        body[free_space_offset - ptr_offset..].copy_from_slice(&buf[free_space_offset..body_len]);
 
         self.header.free_space_offset = free_space_offset as u16;
         debug_assert_eq!(
