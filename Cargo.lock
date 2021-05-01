@@ -325,7 +325,6 @@ name = "haneru"
 version = "0.0.0"
 dependencies = [
  "async-rwlock",
- "byteorder",
  "criterion",
  "flume",
  "fs2",

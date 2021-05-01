@@ -21,7 +21,6 @@
 use std::mem::size_of;
 use std::ops::{Index, IndexMut, Range};
 
-use byteorder::{ByteOrder, NativeEndian};
 use zerocopy::{AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified};
 
 #[derive(Debug, FromBytes, AsBytes)]
@@ -34,7 +33,8 @@ struct Header {
     first_freed_block_offset: u16,
 }
 
-// We can't use `zerocopy` for this struct since this may not be aligned.
+#[derive(Debug, FromBytes, AsBytes)]
+#[repr(C)]
 struct FreedBlock {
     len: u16,
     // 0 if tail
@@ -77,20 +77,13 @@ struct FreedPointer {
 }
 
 impl FreedBlock {
-    fn read(bytes: &[u8]) -> Self {
-        Self {
-            len: NativeEndian::read_u16(&bytes[..2]),
-            next_freed_block_offset: NativeEndian::read_u16(&bytes[2..4]),
+    fn new<B: ByteSlice>(b: B) -> Option<LayoutVerified<B, Self>> {
+        let offset = b.as_ptr().align_offset(std::mem::align_of::<Self>());
+        if offset > b.len() {
+            return None;
         }
-    }
-
-    fn write(&self, bytes: &mut [u8]) {
-        NativeEndian::write_u16(&mut bytes[..2], self.len);
-        NativeEndian::write_u16(&mut bytes[2..4], self.next_freed_block_offset);
-    }
-
-    fn write_next_freed_offset(bytes: &mut [u8], next_freed_offset: u16) {
-        NativeEndian::write_u16(&mut bytes[2..4], next_freed_offset);
+        let (_, b) = b.split_at(offset);
+        LayoutVerified::new_from_prefix(b).map(|t| t.0)
     }
 }
 
@@ -101,7 +94,7 @@ impl<'a, B: ByteSlice> Iterator for FreedBlockIter<'a, B> {
         if self.current == 0 {
             None
         } else {
-            let freed_block = FreedBlock::read(&self.body[self.current as usize..]);
+            let freed_block = FreedBlock::new(&self.body[self.current as usize..]).unwrap();
             let ret = Some(FreedPointer {
                 pointer: Pointer {
                     offset: self.current,
@@ -222,24 +215,26 @@ impl<B: ByteSliceMut> Slotted<B> {
             };
 
             let rest_len = freed_pointer.pointer.len as usize - len;
+            let rest_free_block_pointer = Pointer {
+                offset: freed_pointer.pointer.offset,
+                len: rest_len as u16,
+            };
 
-            if rest_len >= size_of::<FreedBlock>() {
-                let offset = freed_pointer.pointer.offset;
-                let next_freed_block_offset = freed_pointer.next_freed_block_offset;
-
-                FreedBlock {
-                    len: rest_len as u16,
-                    next_freed_block_offset,
-                }
-                .write(&mut self.body[offset as usize..]);
+            if let Some(mut freed_block) =
+                FreedBlock::new(&mut self.body[rest_free_block_pointer.range()])
+            {
+                freed_block.len = rest_len as u16;
+                freed_block.next_freed_block_offset = freed_pointer.next_freed_block_offset;
             } else {
                 if freed_pointer.prev_freed_block_offset == 0 {
                     self.header.first_freed_block_offset = freed_pointer.next_freed_block_offset;
                 } else {
-                    FreedBlock::write_next_freed_offset(
+                    let mut prev_freed_block = FreedBlock::new(
                         &mut self.body[freed_pointer.prev_freed_block_offset as usize..],
-                        freed_pointer.next_freed_block_offset,
-                    );
+                    )
+                    .unwrap();
+                    prev_freed_block.next_freed_block_offset =
+                        freed_pointer.next_freed_block_offset;
                 }
             }
             pointer
@@ -281,13 +276,9 @@ impl<B: ByteSliceMut> Slotted<B> {
 
     fn remove_block(&mut self, index: usize) {
         let pointer = self.pointers()[index];
-        if pointer.len as usize >= size_of::<FreedBlock>() {
-            FreedBlock {
-                len: pointer.len,
-                next_freed_block_offset: self.header.first_freed_block_offset,
-            }
-            .write(&mut self.body[pointer.offset as usize..]);
-
+        if let Some(mut freed_block) = FreedBlock::new(&mut self.body[pointer.range()]) {
+            freed_block.len = pointer.len;
+            freed_block.next_freed_block_offset = self.header.first_freed_block_offset;
             self.header.first_freed_block_offset = pointer.offset;
         }
     }
