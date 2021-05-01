@@ -92,6 +92,10 @@ impl FreedBlock {
     fn write_next_freed_offset(bytes: &mut [u8], next_freed_offset: u16) {
         NativeEndian::write_u16(&mut bytes[2..4], next_freed_offset);
     }
+
+    fn write_len(bytes: &mut [u8], len: u16) {
+        NativeEndian::write_u16(&mut bytes[0..2], len);
+    }
 }
 
 impl<'a, B: ByteSlice> Iterator for FreedBlockIter<'a, B> {
@@ -222,13 +226,7 @@ impl<B: ByteSliceMut> Slotted<B> {
 
             if rest_len >= size_of::<FreedBlock>() {
                 let offset = freed_pointer.pointer.offset;
-                let next_freed_block_offset = freed_pointer.next_freed_block_offset;
-
-                FreedBlock {
-                    len: rest_len as u16,
-                    next_freed_block_offset,
-                }
-                .write(&mut self.body[offset as usize..]);
+                FreedBlock::write_len(&mut self.body[offset as usize..], rest_len as u16);
             } else {
                 if freed_pointer.prev_freed_block_offset == 0 {
                     self.header.first_freed_block_offset = freed_pointer.next_freed_block_offset;
