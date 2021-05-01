@@ -175,7 +175,7 @@ impl<B: ByteSliceMut> Slotted<B> {
     fn defrag(&mut self) {
         let pointers: Vec<(usize, Pointer)> = {
             let mut pointers: Vec<(usize, Pointer)> =
-                self.pointers().iter().cloned().enumerate().collect();
+                self.pointers().iter().copied().enumerate().collect();
             pointers.sort_by_key(|(_, p)| (std::cmp::Reverse(p.offset), std::cmp::Reverse(p.len)));
             pointers
         };
@@ -184,16 +184,36 @@ impl<B: ByteSliceMut> Slotted<B> {
         debug_assert!(pointers
             .windows(2)
             .all(|w| { w[1].1.offset + w[1].1.len <= w[0].1.offset }));
-            */
+        */
 
         let mut free_space_offset = self.body.len();
+        let mut offset = self.body.len() as u16;
+        let mut last_pointer: Option<Pointer> = None;
 
         for (i, pointer) in pointers {
-            self.body
-                .copy_within(pointer.range(), free_space_offset - pointer.len as usize);
-            self.pointers_mut()[i].offset = free_space_offset as u16 - pointer.len;
+            if let Some(lp) = last_pointer {
+                if pointer.offset + pointer.len == lp.offset {
+                    last_pointer = Some(Pointer {
+                        offset: pointer.offset,
+                        len: pointer.len + lp.len,
+                    });
+                } else {
+                    self.body
+                        .copy_within(lp.range(), free_space_offset - lp.len as usize);
+                    free_space_offset -= lp.len as usize;
+                    last_pointer = Some(pointer);
+                }
+            } else {
+                last_pointer = Some(pointer);
+            }
+            self.pointers_mut()[i].offset = offset - pointer.len;
+            offset -= pointer.len;
+        }
 
-            free_space_offset -= pointer.len as usize;
+        if let Some(lp) = last_pointer {
+            self.body
+                .copy_within(lp.range(), free_space_offset - lp.len as usize);
+            free_space_offset -= lp.len as usize;
         }
 
         self.header.free_space_offset = free_space_offset as u16;
