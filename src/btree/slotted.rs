@@ -213,11 +213,23 @@ impl<B: ByteSliceMut> Slotted<B> {
 
     fn allocate(&mut self, len: usize, for_insert: bool) -> Pointer {
         // Best fit
-        if let Some(freed_pointer) = self
+        let mut freed_pointer: Option<FreedPointer> = None;
+        for f in self
             .freed_blocks()
             .filter(|b| b.pointer.len as usize >= len)
-            .min_by_key(|b| b.pointer.len)
         {
+            if f.pointer.len as usize == len {
+                freed_pointer = Some(f);
+                break;
+            }
+
+            freed_pointer = match freed_pointer {
+                None => Some(f),
+                Some(c) if f.pointer.len < c.pointer.len => Some(f),
+                c => c,
+            };
+        }
+        if let Some(freed_pointer) = freed_pointer {
             let pointer = Pointer {
                 offset: freed_pointer.pointer.offset + freed_pointer.pointer.len - len as u16,
                 len: len as u16,
