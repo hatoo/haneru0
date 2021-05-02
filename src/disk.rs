@@ -101,6 +101,7 @@ impl DiskManager {
         while read_len < PAGE_SIZE {
             let mut buf = Aligned::default();
             let len = loop {
+                #[allow(clippy::unnecessary_mut_passed)]
                 match self
                     .ring
                     .read_at(

@@ -190,6 +190,7 @@ impl<B: ByteSliceMut> Slotted<B> {
         let body_len = self.body.len();
         let mut free_space_offset = body_len;
         let ptr_offset = self.pointers_size();
+        #[allow(clippy::uninit_assumed_init)]
         let mut buf: [u8; PAGE_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
         let (pointers, body) = self.body.split_at_mut(ptr_offset);
         let mut pointers = Pointers::new_slice(pointers).unwrap();
@@ -240,16 +241,15 @@ impl<B: ByteSliceMut> Slotted<B> {
             if rest_len >= size_of::<FreedBlock>() {
                 let offset = freed_pointer.pointer.offset;
                 FreedBlock::write_len(&mut self.body[offset as usize..], rest_len as u16);
+            } else if freed_pointer.prev_freed_block_offset == 0 {
+                self.header.first_freed_block_offset = freed_pointer.next_freed_block_offset;
             } else {
-                if freed_pointer.prev_freed_block_offset == 0 {
-                    self.header.first_freed_block_offset = freed_pointer.next_freed_block_offset;
-                } else {
-                    FreedBlock::write_next_freed_offset(
-                        &mut self.body[freed_pointer.prev_freed_block_offset as usize..],
-                        freed_pointer.next_freed_block_offset,
-                    );
-                }
+                FreedBlock::write_next_freed_offset(
+                    &mut self.body[freed_pointer.prev_freed_block_offset as usize..],
+                    freed_pointer.next_freed_block_offset,
+                );
             }
+
             pointer
         } else {
             if self.free_space() < len + if for_insert { size_of::<Pointer>() } else { 0 } {
