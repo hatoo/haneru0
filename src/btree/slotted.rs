@@ -189,7 +189,7 @@ impl<B: ByteSliceMut> Slotted<B> {
     fn defrag(&mut self) {
         let body_len = self.body.len();
         let mut free_space_offset = body_len;
-        let ptr_offset = size_of::<Pointer>() * self.num_slots();
+        let ptr_offset = self.pointers_size();
         let mut buf: [u8; PAGE_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
         let (pointers, body) = self.body.split_at_mut(ptr_offset);
         let mut pointers = Pointers::new_slice(pointers).unwrap();
