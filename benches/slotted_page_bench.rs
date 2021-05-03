@@ -177,7 +177,7 @@ mod relly {
 fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("slotted_page_random_haneru", |b| {
         b.iter(|| {
-            use haneru::btree::slotted::Slotted;
+            use haneru::slotted::Slotted;
             use rand::prelude::*;
 
             let mut rng = StdRng::from_seed([114; 32]);
@@ -211,7 +211,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     c.bench_function("slotted_page_const_size_haneru", |b| {
         b.iter(|| {
-            use haneru::btree::slotted::Slotted;
+            use haneru::slotted::Slotted;
             use rand::prelude::*;
 
             let mut rng = StdRng::from_seed([114; 32]);
