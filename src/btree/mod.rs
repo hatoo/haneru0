@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod branch;
 pub mod leaf;
+pub mod meta;
 pub mod node;
 
 #[derive(Serialize, Deserialize)]
