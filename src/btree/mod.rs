@@ -32,9 +32,17 @@ impl<'a> Pair<'a> {
 }
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub enum InsertError {
     #[error("duplicate key")]
     DuplicateKey,
+    #[error(transparent)]
+    Buffer(#[from] buffer::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum RemoveError {
+    #[error("key not found")]
+    KeyNotFound,
     #[error(transparent)]
     Buffer(#[from] buffer::Error),
 }
@@ -66,7 +74,7 @@ pub struct BTree {
 }
 
 impl BTree {
-    pub async fn create(buffer_pool_manager: BufferPoolManager) -> Result<Self, Error> {
+    pub async fn create(buffer_pool_manager: BufferPoolManager) -> Result<Self, buffer::Error> {
         let free_list = FreeList::create(buffer_pool_manager).await?;
         let root_buffer = free_list.new_page().await?;
         let mut root_buffer_lock = root_buffer.page.write().await;
@@ -87,7 +95,7 @@ impl BTree {
         }
     }
 
-    async fn fetch_root_page(&self) -> Result<Arc<Buffer>, Error> {
+    async fn fetch_root_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
         let root_page_id = {
             let meta_buffer = self.free_list.fetch_meta_page().await?;
             let meta_buffer_lock = meta_buffer.page.read().await;
@@ -102,7 +110,7 @@ impl BTree {
         &self,
         node_buffer: Arc<Buffer>,
         search_mode: SearchMode,
-    ) -> Result<Iter<'_>, Error> {
+    ) -> Result<Iter<'_>, buffer::Error> {
         let node_buffer_lock = node_buffer.page.read().await;
         let node = node::Node::new(node_buffer_lock.as_bytes());
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
@@ -127,7 +135,7 @@ impl BTree {
         }
     }
 
-    pub async fn search(&self, search_mode: SearchMode) -> Result<Iter<'_>, Error> {
+    pub async fn search(&self, search_mode: SearchMode) -> Result<Iter<'_>, buffer::Error> {
         let root_page = self.fetch_root_page().await?;
         self.search_internal(root_page, search_mode).await
     }
@@ -138,13 +146,13 @@ impl BTree {
         buffer: Arc<Buffer>,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<(Vec<u8>, PageId)>, Error> {
+    ) -> Result<Option<(Vec<u8>, PageId)>, InsertError> {
         let mut buffer_lock = buffer.page.write().await;
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
                 let slot_id = match leaf.search_slot_id(key) {
-                    Ok(_) => return Err(Error::DuplicateKey),
+                    Ok(_) => return Err(InsertError::DuplicateKey),
                     Err(slot_id) => slot_id,
                 };
                 if leaf.insert(slot_id, key, value).is_some() {
@@ -212,12 +220,9 @@ impl BTree {
         }
     }
 
-    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        let meta_buffer = self.free_list.fetch_meta_page().await?;
-        let mut meta_buffer_lock = meta_buffer.page.write().await;
-        let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
-        let root_page_id = meta.header.root_page_id;
-        let root_buffer = self.free_list.fetch_page(root_page_id).await?;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
+        let root_buffer = self.fetch_root_page().await?;
+        let root_page_id = root_buffer.page_id;
         if let Some((key, child_page_id)) = self.insert_internal(root_buffer, key, value).await? {
             let new_root_buffer = self.free_list.new_page().await?;
             let mut new_root_buffer_lock = new_root_buffer.page.write().await;
@@ -225,9 +230,67 @@ impl BTree {
             node.initialize_as_branch();
             let mut branch = branch::Branch::new(node.body);
             branch.initialize(&key, child_page_id, root_page_id);
+            let meta_buffer = self.free_list.fetch_meta_page().await?;
+            let mut meta_buffer_lock = meta_buffer.page.write().await;
+            let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
             meta.header.root_page_id = new_root_buffer.page_id;
         }
         Ok(())
+    }
+
+    #[async_recursion]
+    async fn remove_internal(&self, buffer: Arc<Buffer>, key: &[u8]) -> Result<bool, RemoveError> {
+        let mut buffer_lock = buffer.page.write().await;
+        let node = node::Node::new(buffer_lock.as_bytes_mut());
+        match node::Body::new(node.header.node_type, node.body) {
+            node::Body::Leaf(mut leaf) => {
+                let slot_id = match leaf.search_slot_id(key) {
+                    Ok(slot_id) => slot_id,
+                    Err(_) => return Err(RemoveError::KeyNotFound),
+                };
+                leaf.remove(slot_id);
+                if leaf.num_pairs() == 0 {
+                    if let Some(prev_page_id) = leaf.prev_page_id() {
+                        let prev_page_buffer = self.free_list.fetch_page(prev_page_id).await?;
+                        let mut prev_page_lock = prev_page_buffer.page.write().await;
+                        let prev_page = node::Node::new(prev_page_lock.as_bytes_mut());
+                        let mut prev_leaf = leaf::Leaf::new(prev_page.body);
+                        prev_leaf.set_next_page_id(leaf.next_page_id());
+                    }
+                    if let Some(next_page_id) = leaf.next_page_id() {
+                        let next_page_buffer = self.free_list.fetch_page(next_page_id).await?;
+                        let mut next_page_lock = next_page_buffer.page.write().await;
+                        let next_page = node::Node::new(next_page_lock.as_bytes_mut());
+                        let mut next_leaf = leaf::Leaf::new(next_page.body);
+                        next_leaf.set_prev_page_id(leaf.prev_page_id());
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            node::Body::Branch(mut branch) => {
+                let child_idx = branch.search_child_idx(key);
+                let child_page_id = branch.child_at(child_idx);
+                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
+                if self.remove_internal(child_node_buffer, key).await? {
+                    self.free_list.remove_page(child_page_id).await?;
+                    branch.remove(child_idx);
+                    if branch.num_pairs() == 0 && branch.right_child().is_none() {
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    pub async fn remove(&self, key: &[u8]) -> Result<(), RemoveError> {
+        let root_page = self.fetch_root_page().await?;
+        self.remove_internal(root_page, key).await.map(|_| ())
     }
 }
 
@@ -238,41 +301,38 @@ pub struct Iter<'a> {
 }
 
 impl<'a> Iter<'a> {
-    async fn get(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let buffer_lock = self.buffer.page.read().await;
+    #[async_recursion]
+    async fn get(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
+        let buffer = self.buffer.clone();
+        let buffer_lock = buffer.page.read().await;
         let leaf_node = node::Node::new(buffer_lock.as_bytes());
         let leaf = leaf::Leaf::new(leaf_node.body);
         if self.slot_id < leaf.num_pairs() {
             let pair = leaf.pair_at(self.slot_id);
-            Some((pair.key.to_vec(), pair.value.to_vec()))
+            Ok(Some((pair.key.to_vec(), pair.value.to_vec())))
         } else {
-            None
+            if let Some(page_id) = leaf.next_page_id() {
+                let buffer = self.free_list.fetch_page(page_id).await?;
+                self.buffer = buffer;
+                self.slot_id = 0;
+                self.get().await
+            } else {
+                Ok(None)
+            }
         }
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
-        let value = self.get().await;
+    pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
+        let value = self.get().await?;
         self.slot_id += 1;
-        let next_page_id = {
-            let buffer_lock = self.buffer.page.read().await;
-            let leaf_node = node::Node::new(buffer_lock.as_bytes());
-            let leaf = leaf::Leaf::new(leaf_node.body);
-            if self.slot_id < leaf.num_pairs() {
-                return Ok(value);
-            }
-            leaf.next_page_id()
-        };
-        if let Some(next_page_id) = next_page_id {
-            self.buffer = self.free_list.fetch_page(next_page_id).await?;
-            self.slot_id = 0;
-        }
         Ok(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::*;
     use tempfile::NamedTempFile;
 
     use crate::buffer::BufferPoolManager;
@@ -297,6 +357,7 @@ mod tests {
             .unwrap()
             .get()
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(b"hello", &value[..]);
         let (_, value) = btree
@@ -305,6 +366,7 @@ mod tests {
             .unwrap()
             .get()
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(b"!", &value[..]);
     }
@@ -341,7 +403,108 @@ mod tests {
             .unwrap()
             .get()
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(b"hello", &value[..]);
+    }
+
+    #[tokio::test]
+    async fn test_remove() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
+        btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
+        btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
+        btree.insert(&4u64.to_be_bytes(), b",").await.unwrap();
+
+        btree.remove(&6u64.to_be_bytes()).await.unwrap();
+        btree.remove(&4u64.to_be_bytes()).await.unwrap();
+
+        let (_, value) = btree
+            .search(SearchMode::Key(3u64.to_be_bytes().to_vec()))
+            .await
+            .unwrap()
+            .get()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"hello", &value[..]);
+        let (_, value) = btree
+            .search(SearchMode::Key(8u64.to_be_bytes().to_vec()))
+            .await
+            .unwrap()
+            .get()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"!", &value[..]);
+    }
+
+    #[tokio::test]
+    async fn test_random() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let mut memory: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+
+        let mut rng = thread_rng();
+
+        for _ in 0..512 {
+            let p: f32 = rng.gen();
+
+            match p {
+                _ => {
+                    let key = loop {
+                        let mut key = vec![0; rng.gen_range(0..512)];
+                        rng.fill(key.as_mut_slice());
+                        if !memory.contains_key(&key) {
+                            break key;
+                        }
+                    };
+                    let value = {
+                        let mut value = vec![0; rng.gen_range(0..512)];
+                        rng.fill(value.as_mut_slice());
+                        value
+                    };
+                    btree.insert(&key, &value).await.unwrap();
+                    assert!(memory.insert(key, value).is_none());
+                } /*
+                  _ => {
+                      if let Some(key) = memory.keys().choose(&mut rng).cloned() {
+                          dbg!("remove", key.len());
+                          memory.remove(&key).unwrap();
+                          btree.remove(key.as_slice()).await.unwrap();
+                      }
+                  }
+                  */
+            }
+
+            let mut iter = btree.search(SearchMode::Start).await.unwrap();
+            let mut snapshot: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+
+            while let Some((key, value)) = iter.next().await.unwrap() {
+                snapshot.insert(key, value);
+            }
+            assert_eq!(snapshot.len(), memory.len());
+            assert_eq!(snapshot, memory);
+            for (k, v) in memory.iter() {
+                let (bk, bv) = btree
+                    .search(SearchMode::Key(k.clone()))
+                    .await
+                    .unwrap()
+                    .get()
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                assert_eq!(&bk, k);
+                assert_eq!(&bv, v);
+            }
+        }
     }
 }

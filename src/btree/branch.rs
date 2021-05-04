@@ -56,6 +56,10 @@ impl<B: ByteSlice> Branch<B> {
         }
     }
 
+    pub fn right_child(&self) -> Option<PageId> {
+        self.header.right_child.valid()
+    }
+
     pub fn pair_at(&self, slot_id: usize) -> Pair {
         Pair::from_bytes(&self.body[slot_id])
     }
@@ -73,11 +77,14 @@ impl<B: ByteSliceMut> Branch<B> {
         self.header.right_child = right_child;
     }
 
-    pub fn fill_right_child(&mut self) {
+    pub fn fill_right_child(&mut self) -> Vec<u8> {
         let last_id = self.num_pairs() - 1;
-        let right_child: PageId = self.pair_at(last_id).value.into();
+        let Pair { key, value } = self.pair_at(last_id);
+        let right_child: PageId = value.into();
+        let key_vec = key.to_vec();
         self.body.remove(last_id);
         self.header.right_child = right_child;
+        key_vec
     }
 
     #[must_use = "insertion may fail"]
@@ -125,8 +132,20 @@ impl<B: ByteSliceMut> Branch<B> {
                 break;
             }
         }
-        new_branch.fill_right_child();
-        self.pair_at(0).key.to_vec()
+        new_branch.fill_right_child()
+    }
+
+    pub fn remove(&mut self, child_idx: usize) {
+        if child_idx == self.num_pairs() {
+            if self.num_pairs() > 0 {
+                self.header.right_child = self.pair_at(self.num_pairs() - 1).value.into();
+                self.body.remove(self.num_pairs() - 1);
+            } else {
+                self.header.right_child = PageId::INVALID_PAGE_ID;
+            }
+        } else {
+            self.body.remove(child_idx);
+        }
     }
 
     pub fn transfer(&mut self, dest: &mut Branch<impl ByteSliceMut>) {
@@ -170,7 +189,7 @@ mod tests {
         let mut data2 = vec![0u8; 100];
         let mut branch2 = Branch::new(data2.as_mut_slice());
         let mid_key = branch.split_insert(&mut branch2, &10u64.to_be_bytes(), PageId(5));
-        assert_eq!(&10u64.to_be_bytes(), mid_key.as_slice());
+        assert_eq!(&8u64.to_be_bytes(), mid_key.as_slice());
 
         assert_eq!(2, branch.num_pairs());
         assert_eq!(1, branch2.num_pairs());
