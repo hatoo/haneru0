@@ -8,6 +8,7 @@ use zerocopy::{AsBytes, ByteSlice};
 
 use crate::buffer::{self, Buffer, BufferPoolManager};
 use crate::disk::PageId;
+use crate::freelist::FreeList;
 
 pub mod branch;
 pub mod leaf;
@@ -61,43 +62,39 @@ impl SearchMode {
 }
 
 pub struct BTree {
-    pub meta_page_id: PageId,
-    buffer_pool_manager: BufferPoolManager,
+    free_list: FreeList,
 }
 
 impl BTree {
     pub async fn create(buffer_pool_manager: BufferPoolManager) -> Result<Self, Error> {
-        let meta_buffer = buffer_pool_manager.create_page().await?;
-        let mut meta_buffer_lock = meta_buffer.page.write().await;
-        let mut meta = meta::Meta::new(meta_buffer_lock.as_bytes_mut());
-        let root_buffer = buffer_pool_manager.create_page().await?;
+        let free_list = FreeList::create(buffer_pool_manager).await?;
+        let root_buffer = free_list.new_page().await?;
         let mut root_buffer_lock = root_buffer.page.write().await;
         let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
         root.initialize_as_leaf();
         let mut leaf = leaf::Leaf::new(root.body);
         leaf.initialize();
+        let meta_buffer = free_list.fetch_meta_page().await?;
+        let mut meta_buffer_lock = meta_buffer.page.write().await;
+        let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
         meta.header.root_page_id = root_buffer.page_id;
-        Ok(Self::new(meta_buffer.page_id, buffer_pool_manager))
+        Ok(Self { free_list })
     }
 
     pub fn new(meta_page_id: PageId, buffer_pool_manager: BufferPoolManager) -> Self {
         Self {
-            meta_page_id,
-            buffer_pool_manager,
+            free_list: FreeList::new(meta_page_id, buffer_pool_manager),
         }
     }
 
     async fn fetch_root_page(&self) -> Result<Arc<Buffer>, Error> {
         let root_page_id = {
-            let meta_buffer = self
-                .buffer_pool_manager
-                .fetch_page(self.meta_page_id)
-                .await?;
+            let meta_buffer = self.free_list.fetch_meta_page().await?;
             let meta_buffer_lock = meta_buffer.page.read().await;
-            let meta = meta::Meta::new(meta_buffer_lock.as_bytes());
+            let meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes()));
             meta.header.root_page_id
         };
-        Ok(self.buffer_pool_manager.fetch_page(root_page_id).await?)
+        Ok(self.free_list.fetch_page(root_page_id).await?)
     }
 
     #[async_recursion]
@@ -114,7 +111,7 @@ impl BTree {
                 drop(node);
                 drop(node_buffer_lock);
                 Ok(Iter {
-                    buffer_pool_manager: &self.buffer_pool_manager,
+                    free_list: &self.free_list,
                     buffer: node_buffer,
                     slot_id,
                 })
@@ -124,7 +121,7 @@ impl BTree {
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
-                let child_node_page = self.buffer_pool_manager.fetch_page(child_page_id).await?;
+                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
                 self.search_internal(child_node_page, search_mode).await
             }
         }
@@ -155,13 +152,13 @@ impl BTree {
                 } else {
                     let prev_leaf_page_id = leaf.prev_page_id();
                     let prev_leaf_buffer = if let Some(next_leaf_page_id) = prev_leaf_page_id {
-                        Some(self.buffer_pool_manager.fetch_page(next_leaf_page_id).await)
+                        Some(self.free_list.fetch_page(next_leaf_page_id).await)
                     } else {
                         None
                     }
                     .transpose()?;
 
-                    let new_leaf_buffer = self.buffer_pool_manager.create_page().await?;
+                    let new_leaf_buffer = self.free_list.new_page().await?;
 
                     if let Some(prev_leaf_buffer) = prev_leaf_buffer {
                         let mut prev_leaf_buffer_lock = prev_leaf_buffer.page.write().await;
@@ -185,7 +182,7 @@ impl BTree {
             node::Body::Branch(mut branch) => {
                 let child_idx = branch.search_child_idx(key);
                 let child_page_id = branch.child_at(child_idx);
-                let child_node_buffer = self.buffer_pool_manager.fetch_page(child_page_id).await?;
+                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
                 if let Some((overflow_key_from_child, overflow_child_page_id)) =
                     self.insert_internal(child_node_buffer, key, value).await?
                 {
@@ -195,7 +192,7 @@ impl BTree {
                     {
                         Ok(None)
                     } else {
-                        let new_branch_buffer = self.buffer_pool_manager.create_page().await?;
+                        let new_branch_buffer = self.free_list.new_page().await?;
                         let mut new_branch_buffer_lock = new_branch_buffer.page.write().await;
                         let mut new_branch_node =
                             node::Node::new(new_branch_buffer_lock.as_bytes_mut());
@@ -216,16 +213,13 @@ impl BTree {
     }
 
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        let meta_buffer = self
-            .buffer_pool_manager
-            .fetch_page(self.meta_page_id)
-            .await?;
+        let meta_buffer = self.free_list.fetch_meta_page().await?;
         let mut meta_buffer_lock = meta_buffer.page.write().await;
-        let mut meta = meta::Meta::new(meta_buffer_lock.as_bytes_mut());
+        let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
         let root_page_id = meta.header.root_page_id;
-        let root_buffer = self.buffer_pool_manager.fetch_page(root_page_id).await?;
+        let root_buffer = self.free_list.fetch_page(root_page_id).await?;
         if let Some((key, child_page_id)) = self.insert_internal(root_buffer, key, value).await? {
-            let new_root_buffer = self.buffer_pool_manager.create_page().await?;
+            let new_root_buffer = self.free_list.new_page().await?;
             let mut new_root_buffer_lock = new_root_buffer.page.write().await;
             let mut node = node::Node::new(new_root_buffer_lock.as_bytes_mut());
             node.initialize_as_branch();
@@ -238,7 +232,7 @@ impl BTree {
 }
 
 pub struct Iter<'a> {
-    buffer_pool_manager: &'a BufferPoolManager,
+    free_list: &'a FreeList,
     buffer: Arc<Buffer>,
     slot_id: usize,
 }
@@ -270,7 +264,7 @@ impl<'a> Iter<'a> {
             leaf.next_page_id()
         };
         if let Some(next_page_id) = next_page_id {
-            self.buffer = self.buffer_pool_manager.fetch_page(next_page_id).await?;
+            self.buffer = self.free_list.fetch_page(next_page_id).await?;
             self.slot_id = 0;
         }
         Ok(value)
@@ -286,7 +280,7 @@ mod tests {
 
     use super::*;
     #[tokio::test]
-    async fn test() {
+    async fn test_simple() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
 
         let disk_manager = DiskManager::open(&path).unwrap();
