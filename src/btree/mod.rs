@@ -140,6 +140,52 @@ impl BTree {
         self.search_internal(root_page, search_mode).await
     }
 
+    #[cfg(test)]
+    #[async_recursion]
+    async fn search_internal_height(
+        &self,
+        node_buffer: Arc<Buffer>,
+        search_mode: SearchMode,
+    ) -> Result<(Iter<'_>, usize), buffer::Error> {
+        let node_buffer_lock = node_buffer.page.read().await;
+        let node = node::Node::new(node_buffer_lock.as_bytes());
+        match node::Body::new(node.header.node_type, node.body.as_bytes()) {
+            node::Body::Leaf(leaf) => {
+                let slot_id = search_mode.tuple_slot_id(&leaf).unwrap_or_else(identity);
+                drop(node);
+                drop(node_buffer_lock);
+                Ok((
+                    Iter {
+                        free_list: &self.free_list,
+                        buffer: node_buffer,
+                        slot_id,
+                    },
+                    0,
+                ))
+            }
+            node::Body::Branch(branch) => {
+                let child_page_id = search_mode.child_page_id(&branch);
+                drop(node);
+                drop(node_buffer_lock);
+                drop(node_buffer);
+                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
+                let (iter, height) = self
+                    .search_internal_height(child_node_page, search_mode)
+                    .await?;
+                Ok((iter, height + 1))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn search_height(
+        &self,
+        search_mode: SearchMode,
+    ) -> Result<(Iter<'_>, usize), buffer::Error> {
+        let root_page = self.fetch_root_page().await?;
+        self.search_internal_height(root_page, search_mode).await
+    }
+
     #[async_recursion]
     async fn insert_internal(
         &self,
@@ -276,11 +322,7 @@ impl BTree {
                 if self.remove_internal(child_node_buffer, key).await? {
                     self.free_list.remove_page(child_page_id).await?;
                     branch.remove(child_idx);
-                    if branch.num_pairs() == 0 && branch.right_child().is_none() {
-                        Ok(true)
-                    } else {
-                        Ok(false)
-                    }
+                    Ok(branch.num_pairs() == 0 && branch.right_child().is_none())
                 } else {
                     Ok(false)
                 }
@@ -511,6 +553,105 @@ mod tests {
                 assert_eq!(&bk, k);
                 assert_eq!(&bv, v);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_height() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
+
+        let mut rng = StdRng::from_seed([0xDE; 32]);
+
+        for _ in 0..256 {
+            let key = loop {
+                let mut key = vec![0; 512];
+                rng.fill(key.as_mut_slice());
+                if !keys.contains(&key) {
+                    break key;
+                }
+            };
+            let value = {
+                let mut value = vec![0; 512];
+                rng.fill(value.as_mut_slice());
+                value
+            };
+            btree.insert(&key, &value).await.unwrap();
+            assert!(keys.insert(key));
+
+            let mut heights = Vec::new();
+
+            for k in keys.iter() {
+                let (_, height) = btree
+                    .search_height(SearchMode::Key(k.clone()))
+                    .await
+                    .unwrap();
+                heights.push(height);
+            }
+
+            let min_height = heights.iter().min().cloned();
+            let max_height = heights.iter().max().cloned();
+
+            assert_eq!(min_height, max_height);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_remove_height() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
+
+        let mut rng = StdRng::from_seed([0xAF; 32]);
+
+        for _ in 0..256 {
+            let p: f32 = rng.gen();
+            match p {
+                p if p < 0.66 => {
+                    let key = loop {
+                        let mut key = vec![0; 512];
+                        rng.fill(key.as_mut_slice());
+                        if !keys.contains(&key) {
+                            break key;
+                        }
+                    };
+                    let value = {
+                        let mut value = vec![0; 512];
+                        rng.fill(value.as_mut_slice());
+                        value
+                    };
+                    btree.insert(&key, &value).await.unwrap();
+                    assert!(keys.insert(key));
+                }
+                _ => {
+                    if let Some(k) = keys.iter().choose(&mut rng).cloned() {
+                        btree.remove(&k).await.unwrap();
+                        assert!(keys.remove(&k));
+                    }
+                }
+            }
+
+            let mut heights = Vec::new();
+
+            for k in keys.iter() {
+                let (_, height) = btree
+                    .search_height(SearchMode::Key(k.clone()))
+                    .await
+                    .unwrap();
+                heights.push(height);
+            }
+
+            let min_height = heights.iter().min().cloned();
+            let max_height = heights.iter().max().cloned();
+
+            assert_eq!(min_height, max_height);
         }
     }
 }
