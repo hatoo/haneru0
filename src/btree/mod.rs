@@ -290,7 +290,15 @@ impl BTree {
 
     pub async fn remove(&self, key: &[u8]) -> Result<(), RemoveError> {
         let root_page = self.fetch_root_page().await?;
-        self.remove_internal(root_page, key).await.map(|_| ())
+        if self.remove_internal(root_page.clone(), key).await? {
+            let mut root_buffer_lock = root_page.page.write().await;
+            let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
+            root.initialize_as_leaf();
+            let mut leaf = leaf::Leaf::new(root.body);
+            leaf.initialize();
+        }
+
+        Ok(())
     }
 }
 
@@ -452,13 +460,13 @@ mod tests {
         let btree = BTree::create(buffer_pool_manager).await.unwrap();
         let mut memory: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
 
-        let mut rng = thread_rng();
+        let mut rng = StdRng::from_seed([0xDE; 32]);
 
         for _ in 0..512 {
             let p: f32 = rng.gen();
 
             match p {
-                _ => {
+                p if p < 0.6 => {
                     let key = loop {
                         let mut key = vec![0; rng.gen_range(0..512)];
                         rng.fill(key.as_mut_slice());
@@ -473,15 +481,13 @@ mod tests {
                     };
                     btree.insert(&key, &value).await.unwrap();
                     assert!(memory.insert(key, value).is_none());
-                } /*
-                  _ => {
-                      if let Some(key) = memory.keys().choose(&mut rng).cloned() {
-                          dbg!("remove", key.len());
-                          memory.remove(&key).unwrap();
-                          btree.remove(key.as_slice()).await.unwrap();
-                      }
-                  }
-                  */
+                }
+                _ => {
+                    if let Some(key) = memory.keys().choose(&mut rng).cloned() {
+                        memory.remove(&key).unwrap();
+                        btree.remove(key.as_slice()).await.unwrap();
+                    }
+                }
             }
 
             let mut iter = btree.search(SearchMode::Start).await.unwrap();
