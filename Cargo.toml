@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "slotted_page_bench"
 harness = false
+
+[[bench]]
+name = "btree_bench"
+harness = false

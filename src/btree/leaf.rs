@@ -120,6 +120,10 @@ impl<B: ByteSliceMut> Leaf<B> {
         self.pair_at(0).key.to_vec()
     }
 
+    pub fn remove(&mut self, slot_id: usize) {
+        self.body.remove(slot_id)
+    }
+
     pub fn transfer(&mut self, dest: &mut Leaf<impl ByteSliceMut>) {
         let next_index = dest.num_pairs();
         assert!(dest.body.insert(next_index, self.body[0].len()).is_some());

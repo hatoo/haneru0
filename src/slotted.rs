@@ -155,6 +155,7 @@ impl<B: ByteSliceMut> Slotted<B> {
         self.header.num_slots = 0;
         self.header.free_space_offset = self.body.len() as u16;
         self.header.free_space = self.body.len() as u16;
+        self.header.first_freed_block_offset = 0;
     }
 
     fn pointers_mut(&mut self) -> Pointers<&mut [u8]> {
