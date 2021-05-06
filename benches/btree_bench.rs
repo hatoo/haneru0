@@ -66,6 +66,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                         keys.insert(key);
                     }
                     _ => {
+                        // remove
                         if let Some(key) = keys.iter().choose(&mut rng).cloned() {
                             btree.remove(&key).await.unwrap();
                             keys.remove(&key);
