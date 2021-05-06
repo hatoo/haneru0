@@ -239,7 +239,11 @@ impl BTree {
     }
 
     #[async_recursion]
-    async fn remove_internal(&self, buffer: Arc<Buffer>, key: &[u8]) -> Result<bool, RemoveError> {
+    async fn remove_internal(
+        &self,
+        buffer: Arc<Buffer>,
+        key: &[u8],
+    ) -> Result<Option<Option<PageId>>, RemoveError> {
         let mut buffer_lock = buffer.page.write().await;
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
@@ -264,25 +268,31 @@ impl BTree {
                         let mut next_leaf = leaf::Leaf::new(next_page.body);
                         next_leaf.set_prev_page_id(leaf.prev_page_id());
                     }
-                    Ok(true)
+                    Ok(Some(None))
                 } else {
-                    Ok(false)
+                    Ok(None)
                 }
             }
             node::Body::Branch(mut branch) => {
                 let child_idx = branch.search_child_idx(key);
                 let child_page_id = branch.child_at(child_idx);
                 let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
-                if self.remove_internal(child_node_buffer, key).await? {
-                    self.free_list.remove_page(child_page_id).await?;
-                    branch.remove(child_idx);
-                    if branch.num_pairs() == 0 && branch.right_child().is_none() {
-                        Ok(true)
+                if let Some(single_page_id) = self.remove_internal(child_node_buffer, key).await? {
+                    if let Some(single_page_id) = single_page_id {
+                        if branch.update_child(child_idx, single_page_id).is_some() {
+                            self.free_list.remove_page(child_page_id).await?;
+                        }
                     } else {
-                        Ok(false)
+                        self.free_list.remove_page(child_page_id).await?;
+                        branch.remove(child_idx);
+                    }
+                    if branch.num_pairs() == 0 {
+                        Ok(Some(branch.right_child()))
+                    } else {
+                        Ok(None)
                     }
                 } else {
-                    Ok(false)
+                    Ok(None)
                 }
             }
         }
@@ -290,12 +300,23 @@ impl BTree {
 
     pub async fn remove(&self, key: &[u8]) -> Result<(), RemoveError> {
         let root_page = self.fetch_root_page().await?;
-        if self.remove_internal(root_page.clone(), key).await? {
-            let mut root_buffer_lock = root_page.page.write().await;
-            let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
-            root.initialize_as_leaf();
-            let mut leaf = leaf::Leaf::new(root.body);
-            leaf.initialize();
+        if let Some(single_page_id) = self.remove_internal(root_page.clone(), key).await? {
+            if let Some(single_page_id) = single_page_id {
+                let root_page_id = root_page.page_id;
+                drop(root_page);
+                self.free_list.remove_page(root_page_id).await?;
+                let meta_buffer = self.free_list.fetch_meta_page().await?;
+                let mut meta_buffer_lock = meta_buffer.page.write().await;
+                let mut meta =
+                    meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
+                meta.header.root_page_id = single_page_id;
+            } else {
+                let mut root_buffer_lock = root_page.page.write().await;
+                let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
+                root.initialize_as_leaf();
+                let mut leaf = leaf::Leaf::new(root.body);
+                leaf.initialize();
+            }
         }
 
         Ok(())

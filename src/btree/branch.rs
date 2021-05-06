@@ -135,6 +135,24 @@ impl<B: ByteSliceMut> Branch<B> {
         new_branch.fill_right_child()
     }
 
+    pub fn update_child(&mut self, child_idx: usize, new_page_id: PageId) -> Option<()> {
+        if child_idx == self.num_pairs() {
+            self.header.right_child = new_page_id;
+            Some(())
+        } else {
+            let pair = self.pair_at(child_idx);
+            let key = pair.key.to_vec();
+            let value = pair.value.into();
+            self.remove(child_idx);
+            if self.insert(child_idx, &key, new_page_id).is_none() {
+                self.insert(child_idx, &key, value).unwrap();
+                None
+            } else {
+                Some(())
+            }
+        }
+    }
+
     pub fn remove(&mut self, child_idx: usize) {
         if child_idx == self.num_pairs() {
             if self.num_pairs() > 0 {
