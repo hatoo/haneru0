@@ -46,7 +46,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             let mut rng = StdRng::from_seed([0xDE; 32]);
             let mut keys: BTreeSet<Vec<u8>> = Default::default();
 
-            for _ in 0..512 {
+            for _ in 0..1024 {
                 let p: f32 = rng.gen();
                 match p {
                     p if p < 0.60 => {
