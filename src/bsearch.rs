@@ -1,4 +1,7 @@
-use std::cmp::Ordering::{self, Greater, Less};
+use std::{
+    cmp::Ordering::{self, Greater, Less},
+    future::Future,
+};
 
 /*
 * This is originated in Rust core library:
@@ -47,6 +50,31 @@ where
         size = right - left;
     }
     Err(left)
+}
+
+pub async fn binary_search_by_async<F, Fut, E>(
+    mut size: usize,
+    mut f: F,
+) -> Result<Result<usize, usize>, E>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Ordering, E>>,
+{
+    let mut left = 0;
+    let mut right = size;
+    while left < right {
+        let mid = left + size / 2;
+        let cmp = f(mid).await?;
+        if cmp == Less {
+            left = mid + 1;
+        } else if cmp == Greater {
+            right = mid;
+        } else {
+            return Ok(Ok(mid));
+        }
+        size = right - left;
+    }
+    Ok(Err(left))
 }
 
 #[cfg(test)]

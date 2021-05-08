@@ -61,10 +61,14 @@ impl SearchMode {
         }
     }
 
-    fn tuple_slot_id(&self, leaf: &leaf::Leaf<impl ByteSlice>) -> Result<usize, usize> {
+    async fn tuple_slot_id(
+        &self,
+        leaf: &leaf::Leaf<impl ByteSlice>,
+        free_list: &FreeList,
+    ) -> Result<Result<usize, usize>, buffer::Error> {
         match self {
-            SearchMode::Start => Err(0),
-            SearchMode::Key(key) => leaf.search_slot_id(key),
+            SearchMode::Start => Ok(Err(0)),
+            SearchMode::Key(key) => leaf.search_slot_id(key, free_list).await,
         }
     }
 }
@@ -115,7 +119,10 @@ impl BTree {
         let node = node::Node::new(node_buffer_lock.as_bytes());
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
-                let slot_id = search_mode.tuple_slot_id(&leaf).unwrap_or_else(identity);
+                let slot_id = search_mode
+                    .tuple_slot_id(&leaf, &self.free_list)
+                    .await?
+                    .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok(Iter {
@@ -151,7 +158,10 @@ impl BTree {
         let node = node::Node::new(node_buffer_lock.as_bytes());
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
-                let slot_id = search_mode.tuple_slot_id(&leaf).unwrap_or_else(identity);
+                let slot_id = search_mode
+                    .tuple_slot_id(&leaf, &self.free_list)
+                    .await?
+                    .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok((
@@ -197,11 +207,15 @@ impl BTree {
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key) {
+                let slot_id = match leaf.search_slot_id(key, &self.free_list).await? {
                     Ok(_) => return Err(InsertError::DuplicateKey),
                     Err(slot_id) => slot_id,
                 };
-                if leaf.insert(slot_id, key, value).is_some() {
+                if leaf
+                    .insert(slot_id, key, value, &self.free_list)
+                    .await?
+                    .is_some()
+                {
                     Ok(None)
                 } else {
                     let prev_leaf_page_id = leaf.prev_page_id();
@@ -227,7 +241,9 @@ impl BTree {
                     new_leaf_node.initialize_as_leaf();
                     let mut new_leaf = leaf::Leaf::new(new_leaf_node.body);
                     new_leaf.initialize();
-                    let overflow_key = leaf.split_insert(&mut new_leaf, key, value);
+                    let overflow_key = leaf
+                        .split_insert(&mut new_leaf, key, value, &self.free_list)
+                        .await?;
                     new_leaf.set_next_page_id(Some(buffer.page_id));
                     new_leaf.set_prev_page_id(prev_leaf_page_id);
                     Ok(Some((overflow_key, new_leaf_buffer.page_id)))
@@ -290,11 +306,11 @@ impl BTree {
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key) {
+                let slot_id = match leaf.search_slot_id(key, &self.free_list).await? {
                     Ok(slot_id) => slot_id,
                     Err(_) => return Err(RemoveError::KeyNotFound),
                 };
-                leaf.remove(slot_id);
+                leaf.remove(slot_id, &self.free_list).await?;
                 if leaf.num_pairs() == 0 {
                     if let Some(prev_page_id) = leaf.prev_page_id() {
                         let prev_page_buffer = self.free_list.fetch_page(prev_page_id).await?;
@@ -358,7 +374,8 @@ impl<'a> Iter<'a> {
         let leaf_node = node::Node::new(buffer_lock.as_bytes());
         let leaf = leaf::Leaf::new(leaf_node.body);
         if self.slot_id < leaf.num_pairs() {
-            let pair = leaf.pair_at(self.slot_id);
+            let data = leaf.data_at(self.slot_id, &self.free_list).await?;
+            let pair = Pair::from_bytes(&data);
             Ok(Some((pair.key.to_vec(), pair.value.to_vec())))
         } else {
             if let Some(page_id) = leaf.next_page_id() {

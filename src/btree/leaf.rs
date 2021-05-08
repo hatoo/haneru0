@@ -1,11 +1,12 @@
-use std::mem::size_of;
+use std::borrow::Cow;
 
 use zerocopy::{AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified};
 
 use super::Pair;
-use crate::bsearch::binary_search_by;
-use crate::disk::PageId;
-use crate::slotted::{self, Slotted};
+use crate::{bsearch::binary_search_by_async, disk::PageId};
+use crate::{buffer, freelist::FreeList};
+// use crate::slotted::{self, Slotted};
+use crate::slotted_overflow::SlottedOverflow;
 
 #[derive(Debug, FromBytes, AsBytes)]
 #[repr(C)]
@@ -16,14 +17,14 @@ pub struct Header {
 
 pub struct Leaf<B> {
     header: LayoutVerified<B, Header>,
-    body: Slotted<B>,
+    body: SlottedOverflow<B>,
 }
 
 impl<B: ByteSlice> Leaf<B> {
     pub fn new(bytes: B) -> Self {
         let (header, body) =
             LayoutVerified::new_from_prefix(bytes).expect("leaf header must be aligned");
-        let body = Slotted::new(body);
+        let body = SlottedOverflow::new(body);
         Self { header, body }
     }
 
@@ -39,24 +40,37 @@ impl<B: ByteSlice> Leaf<B> {
         self.body.num_slots()
     }
 
-    pub fn search_slot_id(&self, key: &[u8]) -> Result<usize, usize> {
-        binary_search_by(self.num_pairs(), |slot_id| {
-            self.pair_at(slot_id).key.cmp(&key)
+    pub async fn search_slot_id(
+        &self,
+        key: &[u8],
+        free_list: &FreeList,
+    ) -> Result<Result<usize, usize>, buffer::Error> {
+        binary_search_by_async(self.num_pairs(), |slot_id| async move {
+            let data = self.data_at(slot_id, free_list).await?;
+            Ok(Pair::from_bytes(&data).key.cmp(key))
         })
+        .await
     }
 
     #[cfg(test)]
-    pub fn search_pair(&self, key: &[u8]) -> Option<Pair> {
-        let slot_id = self.search_slot_id(key).ok()?;
-        Some(self.pair_at(slot_id))
+    pub async fn search_data(
+        &self,
+        key: &[u8],
+        free_list: &FreeList,
+    ) -> Result<Option<Cow<'_, [u8]>>, buffer::Error> {
+        if let Some(slot_id) = self.search_slot_id(key, free_list).await?.ok() {
+            Ok(Some(self.data_at(slot_id, free_list).await?))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub fn pair_at(&self, slot_id: usize) -> Pair {
-        Pair::from_bytes(&self.body[slot_id])
-    }
-
-    pub fn max_pair_size(&self) -> usize {
-        self.body.capacity() / 2 - size_of::<slotted::Pointer>()
+    pub async fn data_at(
+        &self,
+        slot_id: usize,
+        free_list: &FreeList,
+    ) -> Result<Cow<'_, [u8]>, buffer::Error> {
+        Ok(self.body.fetch(slot_id, free_list).await?)
     }
 }
 
@@ -76,40 +90,49 @@ impl<B: ByteSliceMut> Leaf<B> {
     }
 
     #[must_use = "insertion may fail"]
-    pub fn insert(&mut self, slot_id: usize, key: &[u8], value: &[u8]) -> Option<()> {
+    pub async fn insert(
+        &mut self,
+        slot_id: usize,
+        key: &[u8],
+        value: &[u8],
+        free_list: &FreeList,
+    ) -> Result<Option<()>, buffer::Error> {
         let pair = Pair { key, value };
         let pair_bytes = pair.to_bytes();
-        assert!(pair_bytes.len() <= self.max_pair_size());
-        self.body.insert(slot_id, pair_bytes.len())?;
-        self.body[slot_id].copy_from_slice(&pair_bytes);
-        Some(())
+        Ok(self.body.insert(slot_id, &pair_bytes, free_list).await?)
     }
 
     fn is_half_full(&self) -> bool {
         2 * self.body.free_capacity() < self.body.capacity()
     }
 
-    pub fn split_insert(
+    pub async fn split_insert(
         &mut self,
         new_leaf: &mut Leaf<impl ByteSliceMut>,
         new_key: &[u8],
         new_value: &[u8],
-    ) -> Vec<u8> {
+        free_list: &FreeList,
+    ) -> Result<Vec<u8>, buffer::Error> {
         new_leaf.initialize();
         loop {
             if new_leaf.is_half_full() {
                 let index = self
-                    .search_slot_id(new_key)
+                    .search_slot_id(new_key, free_list)
+                    .await?
                     .expect_err("key must be unique");
-                self.insert(index, new_key, new_value)
+                self.insert(index, new_key, new_value, free_list)
+                    .await?
                     .expect("old leaf must have space");
                 break;
             }
-            if self.pair_at(0).key < new_key {
+            let data = self.data_at(0, free_list).await?;
+            let pair = Pair::from_bytes(&data);
+            if pair.key < new_key {
                 self.transfer(new_leaf);
             } else {
                 new_leaf
-                    .insert(new_leaf.num_pairs(), new_key, new_value)
+                    .insert(new_leaf.num_pairs(), new_key, new_value, free_list)
+                    .await?
                     .expect("new leaf must have space");
                 while !new_leaf.is_half_full() {
                     self.transfer(new_leaf);
@@ -117,21 +140,31 @@ impl<B: ByteSliceMut> Leaf<B> {
                 break;
             }
         }
-        self.pair_at(0).key.to_vec()
+        let data = self.data_at(0, free_list).await?;
+        Ok(Pair::from_bytes(&data).key.to_vec())
     }
 
-    pub fn remove(&mut self, slot_id: usize) {
-        self.body.remove(slot_id)
+    pub async fn remove(
+        &mut self,
+        slot_id: usize,
+        free_list: &FreeList,
+    ) -> Result<(), buffer::Error> {
+        self.body.remove(slot_id, free_list).await
     }
 
     pub fn transfer(&mut self, dest: &mut Leaf<impl ByteSliceMut>) {
+        self.body.transfer(&mut dest.body).unwrap()
+
+        /*
         let next_index = dest.num_pairs();
         assert!(dest.body.insert(next_index, self.body[0].len()).is_some());
         dest.body[next_index].copy_from_slice(&self.body[0]);
         self.body.remove(0);
+        */
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,3 +220,4 @@ mod tests {
         );
     }
 }
+*/
