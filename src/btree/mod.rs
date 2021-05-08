@@ -530,7 +530,7 @@ mod tests {
         let path = NamedTempFile::new().unwrap().into_temp_path();
 
         let disk_manager = DiskManager::open(&path).unwrap();
-        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 256);
         let btree = BTree::create(buffer_pool_manager).await.unwrap();
         let mut memory: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
 
@@ -542,14 +542,14 @@ mod tests {
             match p {
                 p if p < 0.6 => {
                     let key = loop {
-                        let mut key = vec![0; rng.gen_range(0..512)];
+                        let mut key = vec![0; rng.gen_range(0..1024)];
                         rng.fill(key.as_mut_slice());
                         if !memory.contains_key(&key) {
                             break key;
                         }
                     };
                     let value = {
-                        let mut value = vec![0; rng.gen_range(0..512)];
+                        let mut value = vec![0; rng.gen_range(0..1024)];
                         rng.fill(value.as_mut_slice());
                         value
                     };
