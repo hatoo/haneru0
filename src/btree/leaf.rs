@@ -3,10 +3,9 @@ use std::borrow::Cow;
 use zerocopy::{AsBytes, ByteSlice, ByteSliceMut, FromBytes, LayoutVerified};
 
 use super::Pair;
+use crate::slotted_overflow::SlottedOverflow;
 use crate::{bsearch::binary_search_by_async, disk::PageId};
 use crate::{buffer, freelist::FreeList};
-// use crate::slotted::{self, Slotted};
-use crate::slotted_overflow::SlottedOverflow;
 
 #[derive(Debug, FromBytes, AsBytes)]
 #[repr(C)]
