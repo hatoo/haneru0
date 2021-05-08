@@ -36,6 +36,32 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("btree_insert_large", |b| {
+        b.to_async(&rt).iter(|| async {
+            let path = NamedTempFile::new().unwrap().into_temp_path();
+
+            let disk_manager = DiskManager::open(&path).unwrap();
+            let buffer_pool_manager = BufferPoolManager::new(disk_manager, 512);
+            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let mut rng = StdRng::from_seed([0xDE; 32]);
+
+            for _ in 0..64 {
+                let key = {
+                    let mut key = vec![0; rng.gen_range(0..4096)];
+                    rng.fill_bytes(key.as_mut_slice());
+                    key
+                };
+                let value = {
+                    let mut value = vec![0; rng.gen_range(0..4096)];
+                    rng.fill_bytes(value.as_mut_slice());
+                    value
+                };
+
+                let _ = btree.insert(&key, &value).await;
+            }
+        })
+    });
+
     c.bench_function("btree_random", |b| {
         b.to_async(&rt).iter(|| async {
             let path = NamedTempFile::new().unwrap().into_temp_path();
@@ -58,6 +84,47 @@ fn criterion_benchmark(c: &mut Criterion) {
                         };
                         let value = {
                             let mut value = vec![0; rng.gen_range(0..512)];
+                            rng.fill_bytes(value.as_mut_slice());
+                            value
+                        };
+
+                        let _ = btree.insert(&key, &value).await;
+                        keys.insert(key);
+                    }
+                    _ => {
+                        // remove
+                        if let Some(key) = keys.iter().choose(&mut rng).cloned() {
+                            btree.remove(&key).await.unwrap();
+                            keys.remove(&key);
+                        }
+                    }
+                }
+            }
+        })
+    });
+
+    c.bench_function("btree_random_large", |b| {
+        b.to_async(&rt).iter(|| async {
+            let path = NamedTempFile::new().unwrap().into_temp_path();
+
+            let disk_manager = DiskManager::open(&path).unwrap();
+            let buffer_pool_manager = BufferPoolManager::new(disk_manager, 512);
+            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let mut rng = StdRng::from_seed([0xDE; 32]);
+            let mut keys: BTreeSet<Vec<u8>> = Default::default();
+
+            for _ in 0..64 {
+                let p: f32 = rng.gen();
+                match p {
+                    p if p < 0.60 => {
+                        // insert
+                        let key = {
+                            let mut key = vec![0; rng.gen_range(0..4096)];
+                            rng.fill_bytes(key.as_mut_slice());
+                            key
+                        };
+                        let value = {
+                            let mut value = vec![0; rng.gen_range(0..4096)];
                             rng.fill_bytes(value.as_mut_slice());
                             value
                         };
