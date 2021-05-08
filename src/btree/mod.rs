@@ -54,10 +54,14 @@ pub enum SearchMode {
 }
 
 impl SearchMode {
-    fn child_page_id(&self, branch: &branch::Branch<impl ByteSlice>) -> PageId {
+    async fn child_page_id(
+        &self,
+        branch: &branch::Branch<impl ByteSlice>,
+        free_list: &FreeList,
+    ) -> Result<PageId, buffer::Error> {
         match self {
-            SearchMode::Start => branch.child_at(0),
-            SearchMode::Key(key) => branch.search_child(key),
+            SearchMode::Start => branch.child_at(0, free_list).await,
+            SearchMode::Key(key) => branch.search_child(key, free_list).await,
         }
     }
 
@@ -132,7 +136,7 @@ impl BTree {
                 })
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch);
+                let child_page_id = search_mode.child_page_id(&branch, &self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
@@ -174,7 +178,7 @@ impl BTree {
                 ))
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch);
+                let child_page_id = search_mode.child_page_id(&branch, &self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
@@ -250,14 +254,20 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key);
-                let child_page_id = branch.child_at(child_idx);
+                let child_idx = branch.search_child_idx(key, &self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, &self.free_list).await?;
                 let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
                 if let Some((overflow_key_from_child, overflow_child_page_id)) =
                     self.insert_internal(child_node_buffer, key, value).await?
                 {
                     if branch
-                        .insert(child_idx, &overflow_key_from_child, overflow_child_page_id)
+                        .insert(
+                            child_idx,
+                            &overflow_key_from_child,
+                            overflow_child_page_id,
+                            &self.free_list,
+                        )
+                        .await?
                         .is_some()
                     {
                         Ok(None)
@@ -268,11 +278,14 @@ impl BTree {
                             node::Node::new(new_branch_buffer_lock.as_bytes_mut());
                         new_branch_node.initialize_as_branch();
                         let mut new_branch = branch::Branch::new(new_branch_node.body);
-                        let overflow_key = branch.split_insert(
-                            &mut new_branch,
-                            &overflow_key_from_child,
-                            overflow_child_page_id,
-                        );
+                        let overflow_key = branch
+                            .split_insert(
+                                &mut new_branch,
+                                &overflow_key_from_child,
+                                overflow_child_page_id,
+                                &self.free_list,
+                            )
+                            .await?;
                         Ok(Some((overflow_key, new_branch_buffer.page_id)))
                     }
                 } else {
@@ -291,7 +304,9 @@ impl BTree {
             let mut node = node::Node::new(new_root_buffer_lock.as_bytes_mut());
             node.initialize_as_branch();
             let mut branch = branch::Branch::new(node.body);
-            branch.initialize(&key, child_page_id, root_page_id);
+            branch
+                .initialize(&key, child_page_id, root_page_id, &self.free_list)
+                .await?;
             let meta_buffer = self.free_list.fetch_meta_page().await?;
             let mut meta_buffer_lock = meta_buffer.page.write().await;
             let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
@@ -332,12 +347,12 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key);
-                let child_page_id = branch.child_at(child_idx);
+                let child_idx = branch.search_child_idx(key, &self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, &self.free_list).await?;
                 let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
                 if self.remove_internal(child_node_buffer, key).await? {
                     self.free_list.remove_page(child_page_id).await?;
-                    branch.remove(child_idx);
+                    branch.remove(child_idx, &self.free_list).await?;
                     Ok(branch.num_pairs() == 0 && branch.right_child().is_none())
                 } else {
                     Ok(false)

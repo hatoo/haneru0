@@ -154,13 +154,6 @@ impl<B: ByteSliceMut> Leaf<B> {
 
     pub fn transfer(&mut self, dest: &mut Leaf<impl ByteSliceMut>) {
         self.body.transfer(&mut dest.body).unwrap()
-
-        /*
-        let next_index = dest.num_pairs();
-        assert!(dest.body.insert(next_index, self.body[0].len()).is_some());
-        dest.body[next_index].copy_from_slice(&self.body[0]);
-        self.body.remove(0);
-        */
     }
 }
 
