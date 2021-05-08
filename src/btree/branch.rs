@@ -199,52 +199,87 @@ impl<B: ByteSliceMut> Branch<B> {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_insert_search() {
-        let mut data = vec![0u8; 100];
-        let mut branch = Branch::new(data.as_mut_slice());
-        branch.initialize(&5u64.to_be_bytes(), PageId(1), PageId(2));
-        branch.insert(1, &8u64.to_be_bytes(), PageId(3)).unwrap();
-        branch.insert(2, &11u64.to_be_bytes(), PageId(4)).unwrap();
-        assert_eq!(PageId(1), branch.search_child(&1u64.to_be_bytes()));
-        assert_eq!(PageId(3), branch.search_child(&5u64.to_be_bytes()));
-        assert_eq!(PageId(3), branch.search_child(&6u64.to_be_bytes()));
-        assert_eq!(PageId(4), branch.search_child(&8u64.to_be_bytes()));
-        assert_eq!(PageId(4), branch.search_child(&10u64.to_be_bytes()));
-        assert_eq!(PageId(2), branch.search_child(&11u64.to_be_bytes()));
-        assert_eq!(PageId(2), branch.search_child(&12u64.to_be_bytes()));
-    }
+    use crate::buffer::BufferPoolManager;
+    use crate::disk::DiskManager;
 
-    #[test]
-    fn test_split() {
-        let mut data = vec![0u8; 100];
-        let mut branch = Branch::new(data.as_mut_slice());
-        branch.initialize(&5u64.to_be_bytes(), PageId(1), PageId(2));
-        branch.insert(1, &8u64.to_be_bytes(), PageId(3)).unwrap();
-        branch.insert(2, &11u64.to_be_bytes(), PageId(4)).unwrap();
+    #[tokio::test]
+    async fn test_insert_search() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
 
-        let mut data2 = vec![0u8; 100];
-        let mut branch2 = Branch::new(data2.as_mut_slice());
-        let mid_key = branch.split_insert(&mut branch2, &10u64.to_be_bytes(), PageId(5));
-        assert_eq!(&8u64.to_be_bytes(), mid_key.as_slice());
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
 
-        assert_eq!(2, branch.num_pairs());
-        assert_eq!(1, branch2.num_pairs());
-
-        assert_eq!(PageId(1), branch2.search_child(&1u64.to_be_bytes()));
-        assert_eq!(PageId(3), branch2.search_child(&5u64.to_be_bytes()));
-        assert_eq!(PageId(3), branch2.search_child(&6u64.to_be_bytes()));
-
-        assert_eq!(PageId(5), branch.search_child(&9u64.to_be_bytes()));
-        assert_eq!(PageId(4), branch.search_child(&10u64.to_be_bytes()));
-        assert_eq!(PageId(2), branch.search_child(&11u64.to_be_bytes()));
-        assert_eq!(PageId(2), branch.search_child(&12u64.to_be_bytes()));
+        let page = free_list.new_page().await.unwrap();
+        let mut page_lock = page.page.write().await;
+        let mut branch = Branch::new(page_lock.as_bytes_mut());
+        branch
+            .initialize(&5u64.to_be_bytes(), PageId(1), PageId(2), &free_list)
+            .await
+            .unwrap();
+        branch
+            .insert(1, &8u64.to_be_bytes(), PageId(3), &free_list)
+            .await
+            .unwrap()
+            .unwrap();
+        branch
+            .insert(2, &11u64.to_be_bytes(), PageId(4), &free_list)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            PageId(1),
+            branch
+                .search_child(&1u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(3),
+            branch
+                .search_child(&5u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(3),
+            branch
+                .search_child(&6u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(4),
+            branch
+                .search_child(&8u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(4),
+            branch
+                .search_child(&10u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(2),
+            branch
+                .search_child(&11u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            PageId(2),
+            branch
+                .search_child(&12u64.to_be_bytes(), &free_list)
+                .await
+                .unwrap()
+        );
     }
 }
-
-*/
