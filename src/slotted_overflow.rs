@@ -441,6 +441,37 @@ impl<B: ByteSliceMut> SlottedOverflow<B> {
         Ok(())
     }
 
+    fn insert_raw(&mut self, index: usize, is_overflow: bool, bytes: &[u8]) -> Option<()> {
+        if self.free_capacity() < size_of::<Pointer>() + bytes.len() {
+            return None;
+        }
+
+        if self.free_space() < size_of::<Pointer>() {
+            self.defrag();
+            debug_assert!(self.free_space() >= size_of::<Pointer>());
+        }
+        let pointer = self.allocate(bytes.len(), true);
+        debug_assert_eq!(pointer.len, bytes.len() as u16);
+        let num_slots_orig = self.num_slots();
+        self.header.num_slots += 1;
+        let mut pointers_mut = self.pointers_mut();
+        pointers_mut.copy_within(index..num_slots_orig, index + 1);
+        pointers_mut[index] = if is_overflow {
+            Pointer {
+                len: Length::OVERFLOWED,
+                offset: pointer.offset,
+            }
+        } else {
+            Pointer {
+                len: Length(pointer.len),
+                offset: pointer.offset,
+            }
+        };
+        self.header.free_space -= bytes.len() as u16 + size_of::<Pointer>() as u16;
+        self.body[pointer.range()].copy_from_slice(bytes);
+        Some(())
+    }
+
     pub async fn insert(
         &mut self,
         index: usize,
@@ -512,6 +543,19 @@ impl<B: ByteSliceMut> SlottedOverflow<B> {
         Ok(())
     }
 
+    fn remove_block_raw(&mut self, index: usize) {
+        let pointer = self.pointers()[index];
+        if pointer.len.actual_len() >= size_of::<FreedBlock>() {
+            FreedBlock {
+                len: pointer.len.actual_len() as u16,
+                next_freed_block_offset: self.header.first_freed_block_offset,
+            }
+            .write(&mut self.body[pointer.offset as usize..]);
+
+            self.header.first_freed_block_offset = pointer.offset;
+        }
+    }
+
     pub async fn remove(
         &mut self,
         index: usize,
@@ -524,6 +568,15 @@ impl<B: ByteSliceMut> SlottedOverflow<B> {
         self.header.num_slots -= 1;
         self.header.free_space += pointer.len.actual_len() as u16 + size_of::<Pointer>() as u16;
         Ok(())
+    }
+
+    fn remove_raw(&mut self, index: usize) {
+        let pointer = self.pointers()[index];
+        self.remove_block_raw(index);
+
+        self.pointers_mut().copy_within(index + 1.., index);
+        self.header.num_slots -= 1;
+        self.header.free_space += pointer.len.actual_len() as u16 + size_of::<Pointer>() as u16;
     }
 
     pub async fn replace(
@@ -554,6 +607,23 @@ impl<B: ByteSliceMut> SlottedOverflow<B> {
             Ok(Some(()))
         } else {
             Ok(None)
+        }
+    }
+
+    pub fn transfer(&mut self, dest: &mut SlottedOverflow<impl ByteSliceMut>) -> Option<()> {
+        let pointer = self.pointers()[0];
+        if dest
+            .insert_raw(
+                dest.num_slots(),
+                pointer.len.valid().is_none(),
+                &self.body[pointer.range()],
+            )
+            .is_some()
+        {
+            self.remove_raw(0);
+            Some(())
+        } else {
+            None
         }
     }
 }
