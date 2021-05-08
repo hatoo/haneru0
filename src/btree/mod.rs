@@ -542,14 +542,14 @@ mod tests {
             match p {
                 p if p < 0.6 => {
                     let key = loop {
-                        let mut key = vec![0; rng.gen_range(0..1024)];
+                        let mut key = vec![0; rng.gen_range(0..4096)];
                         rng.fill(key.as_mut_slice());
                         if !memory.contains_key(&key) {
                             break key;
                         }
                     };
                     let value = {
-                        let mut value = vec![0; rng.gen_range(0..1024)];
+                        let mut value = vec![0; rng.gen_range(0..4096)];
                         rng.fill(value.as_mut_slice());
                         value
                     };
