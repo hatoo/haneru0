@@ -157,60 +157,82 @@ impl<B: ByteSliceMut> Leaf<B> {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_leaf_insert() {
-        let mut page_data = vec![0; 100];
-        let mut leaf_page = Leaf::new(page_data.as_mut_slice());
+    use crate::buffer::BufferPoolManager;
+    use crate::disk::DiskManager;
+
+    #[tokio::test]
+    async fn test_leaf_insert() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+
+        let page = free_list.new_page().await.unwrap();
+        let mut page_lock = page.page.write().await;
+        let mut leaf_page = Leaf::new(page_lock.as_bytes_mut());
         leaf_page.initialize();
 
-        let id = leaf_page.search_slot_id(b"deadbeef").unwrap_err();
+        let id = leaf_page
+            .search_slot_id(b"deadbeef", &free_list)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(0, id);
-        leaf_page.insert(id, b"deadbeef", b"world").unwrap();
-        assert_eq!(b"deadbeef", leaf_page.pair_at(0).key);
+        leaf_page
+            .insert(id, b"deadbeef", b"world", &free_list)
+            .await
+            .unwrap()
+            .unwrap();
 
-        let id = leaf_page.search_slot_id(b"facebook").unwrap_err();
+        let data = leaf_page.data_at(0, &free_list).await.unwrap();
+        assert_eq!(b"deadbeef", Pair::from_bytes(&data).key);
+
+        let id = leaf_page
+            .search_slot_id(b"facebook", &free_list)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(1, id);
-        leaf_page.insert(id, b"facebook", b"!").unwrap();
-        assert_eq!(b"deadbeef", leaf_page.pair_at(0).key);
-        assert_eq!(b"facebook", leaf_page.pair_at(1).key);
+        leaf_page
+            .insert(id, b"facebook", b"!", &free_list)
+            .await
+            .unwrap()
+            .unwrap();
 
-        let id = leaf_page.search_slot_id(b"beefdead").unwrap_err();
+        let data = leaf_page.data_at(0, &free_list).await.unwrap();
+        assert_eq!(b"deadbeef", Pair::from_bytes(&data).key);
+        let data = leaf_page.data_at(1, &free_list).await.unwrap();
+        assert_eq!(b"facebook", Pair::from_bytes(&data).key);
+
+        let id = leaf_page
+            .search_slot_id(b"beefdead", &free_list)
+            .await
+            .unwrap()
+            .unwrap_err();
         assert_eq!(0, id);
-        leaf_page.insert(id, b"beefdead", b"hello").unwrap();
-        assert_eq!(b"beefdead", leaf_page.pair_at(0).key);
-        assert_eq!(b"deadbeef", leaf_page.pair_at(1).key);
-        assert_eq!(b"facebook", leaf_page.pair_at(2).key);
-        assert_eq!(
-            &b"hello"[..],
-            leaf_page.search_pair(b"beefdead").unwrap().value
-        );
-    }
+        leaf_page
+            .insert(id, b"beefdead", b"hello", &free_list)
+            .await
+            .unwrap()
+            .unwrap();
 
-    #[test]
-    fn test_leaf_split_insert() {
-        let mut page_data = vec![0; 62];
-        let mut leaf_page = Leaf::new(page_data.as_mut_slice());
-        leaf_page.initialize();
-        let id = leaf_page.search_slot_id(b"deadbeef").unwrap_err();
-        leaf_page.insert(id, b"deadbeef", b"world").unwrap();
-        let id = leaf_page.search_slot_id(b"facebook").unwrap_err();
-        leaf_page.insert(id, b"facebook", b"!").unwrap();
-        let id = leaf_page.search_slot_id(b"beefdead").unwrap_err();
-        assert!(leaf_page.insert(id, b"beefdead", b"hello").is_none());
-
-        let mut leaf_page = Leaf::new(page_data.as_mut_slice());
-        let mut new_page_data = vec![0; 62];
-        let mut new_leaf_page = Leaf::new(new_page_data.as_mut_slice());
-        leaf_page.split_insert(&mut new_leaf_page, b"beefdead", b"hello");
-        assert_eq!(
-            &b"world"[..],
-            new_leaf_page.search_pair(b"deadbeef").unwrap().value
-        );
+        let data = leaf_page.data_at(0, &free_list).await.unwrap();
+        assert_eq!(b"beefdead", Pair::from_bytes(&data).key);
+        let data = leaf_page.data_at(1, &free_list).await.unwrap();
+        assert_eq!(b"deadbeef", Pair::from_bytes(&data).key);
+        let data = leaf_page.data_at(2, &free_list).await.unwrap();
+        assert_eq!(b"facebook", Pair::from_bytes(&data).key);
+        let data = leaf_page
+            .search_data(b"beefdead", &free_list)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"hello", Pair::from_bytes(&data).value);
     }
 }
-*/
