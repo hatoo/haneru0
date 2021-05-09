@@ -593,7 +593,7 @@ mod tests {
         let path = NamedTempFile::new().unwrap().into_temp_path();
 
         let disk_manager = DiskManager::open(&path).unwrap();
-        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 64);
         let btree = BTree::create(buffer_pool_manager).await.unwrap();
         let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
 
@@ -637,7 +637,7 @@ mod tests {
         let path = NamedTempFile::new().unwrap().into_temp_path();
 
         let disk_manager = DiskManager::open(&path).unwrap();
-        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 64);
         let btree = BTree::create(buffer_pool_manager).await.unwrap();
         let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
 
