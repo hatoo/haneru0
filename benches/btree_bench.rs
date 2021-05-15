@@ -32,7 +32,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     value
                 };
 
-                let _ = btree.insert(&key, &value, &free_list).await;
+                let _ = btree.insert(&key, &value).await;
             }
         })
     });
@@ -59,7 +59,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     value
                 };
 
-                let _ = btree.insert(&key, &value, &free_list).await;
+                let _ = btree.insert(&key, &value).await;
             }
         })
     });
@@ -91,13 +91,13 @@ fn criterion_benchmark(c: &mut Criterion) {
                             value
                         };
 
-                        let _ = btree.insert(&key, &value, &free_list).await;
+                        let _ = btree.insert(&key, &value).await;
                         keys.insert(key);
                     }
                     _ => {
                         // remove
                         if let Some(key) = keys.iter().choose(&mut rng).cloned() {
-                            btree.remove(&key, &free_list).await.unwrap();
+                            btree.remove(&key).await.unwrap();
                             keys.remove(&key);
                         }
                     }
@@ -133,13 +133,13 @@ fn criterion_benchmark(c: &mut Criterion) {
                             value
                         };
 
-                        let _ = btree.insert(&key, &value, &free_list).await;
+                        let _ = btree.insert(&key, &value).await;
                         keys.insert(key);
                     }
                     _ => {
                         // remove
                         if let Some(key) = keys.iter().choose(&mut rng).cloned() {
-                            btree.remove(&key, &free_list).await.unwrap();
+                            btree.remove(&key).await.unwrap();
                             keys.remove(&key);
                         }
                     }

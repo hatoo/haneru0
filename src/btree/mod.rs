@@ -77,12 +77,13 @@ impl SearchMode {
     }
 }
 
-pub struct BTree {
+pub struct BTree<'a> {
     pub meta_page_id: PageId,
+    free_list: &'a FreeList,
 }
 
-impl BTree {
-    pub async fn create(free_list: &FreeList) -> Result<Self, buffer::Error> {
+impl<'a> BTree<'a> {
+    pub async fn create(free_list: &'a FreeList) -> Result<BTree<'a>, buffer::Error> {
         let root_buffer = free_list.new_page().await?;
         let mut root_buffer_lock = root_buffer.page.write().await;
         let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
@@ -95,93 +96,89 @@ impl BTree {
         meta.header.root_page_id = root_buffer.page_id;
         Ok(Self {
             meta_page_id: meta_buffer.page_id,
+            free_list,
         })
     }
 
-    pub fn new(meta_page_id: PageId) -> Self {
-        Self { meta_page_id }
+    pub fn new(meta_page_id: PageId, free_list: &'a FreeList) -> Self {
+        Self {
+            meta_page_id,
+            free_list,
+        }
     }
 
-    async fn fetch_meta_page(&self, free_list: &FreeList) -> Result<Arc<Buffer>, buffer::Error> {
-        Ok(free_list.fetch_page(self.meta_page_id).await?)
+    async fn fetch_meta_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
+        Ok(self.free_list.fetch_page(self.meta_page_id).await?)
     }
 
-    async fn fetch_root_page(&self, free_list: &FreeList) -> Result<Arc<Buffer>, buffer::Error> {
+    async fn fetch_root_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
         let root_page_id = {
-            let meta_buffer = free_list.fetch_page(self.meta_page_id).await?;
+            let meta_buffer = self.free_list.fetch_page(self.meta_page_id).await?;
             let meta_buffer_lock = meta_buffer.page.read().await;
             let meta = meta::Meta::new(meta_buffer_lock.as_bytes());
             meta.header.root_page_id
         };
-        Ok(free_list.fetch_page(root_page_id).await?)
+        Ok(self.free_list.fetch_page(root_page_id).await?)
     }
 
     #[async_recursion]
-    async fn search_internal<'a>(
+    async fn search_internal(
         &self,
         node_buffer: Arc<Buffer>,
         search_mode: SearchMode,
-        free_list: &'a FreeList,
-    ) -> Result<Iter<'a>, buffer::Error> {
+    ) -> Result<Iter<'_>, buffer::Error> {
         let node_buffer_lock = node_buffer.page.read().await;
         let node = node::Node::new(node_buffer_lock.as_bytes());
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
                 let slot_id = search_mode
-                    .tuple_slot_id(&leaf, free_list)
+                    .tuple_slot_id(&leaf, self.free_list)
                     .await?
                     .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok(Iter {
-                    free_list: free_list,
+                    free_list: self.free_list,
                     buffer: node_buffer,
                     slot_id,
                 })
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, free_list).await?;
+                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
-                let child_node_page = free_list.fetch_page(child_page_id).await?;
-                self.search_internal(child_node_page, search_mode, free_list)
-                    .await
+                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
+                self.search_internal(child_node_page, search_mode).await
             }
         }
     }
 
-    pub async fn search<'a>(
-        &self,
-        search_mode: SearchMode,
-        free_list: &'a FreeList,
-    ) -> Result<Iter<'a>, buffer::Error> {
-        let root_page = self.fetch_root_page(free_list).await?;
-        self.search_internal(root_page, search_mode, free_list)
-            .await
+    pub async fn search(&self, search_mode: SearchMode) -> Result<Iter<'_>, buffer::Error> {
+        let root_page = self.fetch_root_page().await?;
+        self.search_internal(root_page, search_mode).await
     }
 
     #[cfg(test)]
     #[async_recursion]
-    async fn search_internal_height<'a>(
+    async fn search_internal_height(
         &self,
         node_buffer: Arc<Buffer>,
         search_mode: SearchMode,
-        free_list: &'a FreeList,
-    ) -> Result<(Iter<'a>, usize), buffer::Error> {
+    ) -> Result<(Iter<'_>, usize), buffer::Error> {
         let node_buffer_lock = node_buffer.page.read().await;
         let node = node::Node::new(node_buffer_lock.as_bytes());
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
                 let slot_id = search_mode
-                    .tuple_slot_id(&leaf, free_list)
+                    .tuple_slot_id(&leaf, self.free_list)
                     .await?
                     .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok((
                     Iter {
-                        free_list: free_list,
+                        free_list: self.free_list,
                         buffer: node_buffer,
                         slot_id,
                     },
@@ -189,13 +186,13 @@ impl BTree {
                 ))
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, free_list).await?;
+                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
-                let child_node_page = free_list.fetch_page(child_page_id).await?;
+                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
                 let (iter, height) = self
-                    .search_internal_height(child_node_page, search_mode, free_list)
+                    .search_internal_height(child_node_page, search_mode)
                     .await?;
                 Ok((iter, height + 1))
             }
@@ -203,14 +200,12 @@ impl BTree {
     }
 
     #[cfg(test)]
-    pub async fn search_height<'a>(
+    pub async fn search_height(
         &self,
         search_mode: SearchMode,
-        free_list: &'a FreeList,
-    ) -> Result<(Iter<'a>, usize), buffer::Error> {
-        let root_page = self.fetch_root_page(free_list).await?;
-        self.search_internal_height(root_page, search_mode, free_list)
-            .await
+    ) -> Result<(Iter<'_>, usize), buffer::Error> {
+        let root_page = self.fetch_root_page().await?;
+        self.search_internal_height(root_page, search_mode).await
     }
 
     #[async_recursion]
@@ -219,28 +214,31 @@ impl BTree {
         buffer: Arc<Buffer>,
         key: &[u8],
         value: &[u8],
-        free_list: &FreeList,
     ) -> Result<Option<(Vec<u8>, PageId)>, InsertError> {
         let mut buffer_lock = buffer.page.write().await;
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, free_list).await? {
+                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
                     Ok(_) => return Err(InsertError::DuplicateKey),
                     Err(slot_id) => slot_id,
                 };
-                if leaf.insert(slot_id, key, value, free_list).await?.is_some() {
+                if leaf
+                    .insert(slot_id, key, value, self.free_list)
+                    .await?
+                    .is_some()
+                {
                     Ok(None)
                 } else {
                     let prev_leaf_page_id = leaf.prev_page_id();
                     let prev_leaf_buffer = if let Some(next_leaf_page_id) = prev_leaf_page_id {
-                        Some(free_list.fetch_page(next_leaf_page_id).await)
+                        Some(self.free_list.fetch_page(next_leaf_page_id).await)
                     } else {
                         None
                     }
                     .transpose()?;
 
-                    let new_leaf_buffer = free_list.new_page().await?;
+                    let new_leaf_buffer = self.free_list.new_page().await?;
 
                     if let Some(prev_leaf_buffer) = prev_leaf_buffer {
                         let mut prev_leaf_buffer_lock = prev_leaf_buffer.page.write().await;
@@ -256,7 +254,7 @@ impl BTree {
                     let mut new_leaf = leaf::Leaf::new(new_leaf_node.body);
                     new_leaf.initialize();
                     let overflow_key = leaf
-                        .split_insert(&mut new_leaf, key, value, free_list)
+                        .split_insert(&mut new_leaf, key, value, self.free_list)
                         .await?;
                     new_leaf.set_next_page_id(Some(buffer.page_id));
                     new_leaf.set_prev_page_id(prev_leaf_page_id);
@@ -264,26 +262,25 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, free_list).await?;
-                let child_page_id = branch.child_at(child_idx, free_list).await?;
-                let child_node_buffer = free_list.fetch_page(child_page_id).await?;
-                if let Some((overflow_key_from_child, overflow_child_page_id)) = self
-                    .insert_internal(child_node_buffer, key, value, free_list)
-                    .await?
+                let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
+                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
+                if let Some((overflow_key_from_child, overflow_child_page_id)) =
+                    self.insert_internal(child_node_buffer, key, value).await?
                 {
                     if branch
                         .insert(
                             child_idx,
                             &overflow_key_from_child,
                             overflow_child_page_id,
-                            free_list,
+                            self.free_list,
                         )
                         .await?
                         .is_some()
                     {
                         Ok(None)
                     } else {
-                        let new_branch_buffer = free_list.new_page().await?;
+                        let new_branch_buffer = self.free_list.new_page().await?;
                         let mut new_branch_buffer_lock = new_branch_buffer.page.write().await;
                         let mut new_branch_node =
                             node::Node::new(new_branch_buffer_lock.as_bytes_mut());
@@ -294,7 +291,7 @@ impl BTree {
                                 &mut new_branch,
                                 &overflow_key_from_child,
                                 overflow_child_page_id,
-                                free_list,
+                                self.free_list,
                             )
                             .await?;
                         Ok(Some((overflow_key, new_branch_buffer.page_id)))
@@ -306,27 +303,19 @@ impl BTree {
         }
     }
 
-    pub async fn insert(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        free_list: &FreeList,
-    ) -> Result<(), InsertError> {
-        let root_buffer = self.fetch_root_page(free_list).await?;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
+        let root_buffer = self.fetch_root_page().await?;
         let root_page_id = root_buffer.page_id;
-        if let Some((key, child_page_id)) = self
-            .insert_internal(root_buffer, key, value, free_list)
-            .await?
-        {
-            let new_root_buffer = free_list.new_page().await?;
+        if let Some((key, child_page_id)) = self.insert_internal(root_buffer, key, value).await? {
+            let new_root_buffer = self.free_list.new_page().await?;
             let mut new_root_buffer_lock = new_root_buffer.page.write().await;
             let mut node = node::Node::new(new_root_buffer_lock.as_bytes_mut());
             node.initialize_as_branch();
             let mut branch = branch::Branch::new(node.body);
             branch
-                .initialize(&key, child_page_id, root_page_id, free_list)
+                .initialize(&key, child_page_id, root_page_id, self.free_list)
                 .await?;
-            let meta_buffer = self.fetch_meta_page(free_list).await?;
+            let meta_buffer = self.fetch_meta_page().await?;
             let mut meta_buffer_lock = meta_buffer.page.write().await;
             let mut meta = meta::Meta::new(meta_buffer_lock.as_bytes_mut());
             meta.header.root_page_id = new_root_buffer.page_id;
@@ -335,31 +324,26 @@ impl BTree {
     }
 
     #[async_recursion]
-    async fn remove_internal(
-        &self,
-        buffer: Arc<Buffer>,
-        key: &[u8],
-        free_list: &FreeList,
-    ) -> Result<bool, RemoveError> {
+    async fn remove_internal(&self, buffer: Arc<Buffer>, key: &[u8]) -> Result<bool, RemoveError> {
         let mut buffer_lock = buffer.page.write().await;
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, free_list).await? {
+                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
                     Ok(slot_id) => slot_id,
                     Err(_) => return Err(RemoveError::KeyNotFound),
                 };
-                leaf.remove(slot_id, free_list).await?;
+                leaf.remove(slot_id, self.free_list).await?;
                 if leaf.num_pairs() == 0 {
                     if let Some(prev_page_id) = leaf.prev_page_id() {
-                        let prev_page_buffer = free_list.fetch_page(prev_page_id).await?;
+                        let prev_page_buffer = self.free_list.fetch_page(prev_page_id).await?;
                         let mut prev_page_lock = prev_page_buffer.page.write().await;
                         let prev_page = node::Node::new(prev_page_lock.as_bytes_mut());
                         let mut prev_leaf = leaf::Leaf::new(prev_page.body);
                         prev_leaf.set_next_page_id(leaf.next_page_id());
                     }
                     if let Some(next_page_id) = leaf.next_page_id() {
-                        let next_page_buffer = free_list.fetch_page(next_page_id).await?;
+                        let next_page_buffer = self.free_list.fetch_page(next_page_id).await?;
                         let mut next_page_lock = next_page_buffer.page.write().await;
                         let next_page = node::Node::new(next_page_lock.as_bytes_mut());
                         let mut next_leaf = leaf::Leaf::new(next_page.body);
@@ -371,15 +355,12 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, free_list).await?;
-                let child_page_id = branch.child_at(child_idx, free_list).await?;
-                let child_node_buffer = free_list.fetch_page(child_page_id).await?;
-                if self
-                    .remove_internal(child_node_buffer, key, free_list)
-                    .await?
-                {
-                    free_list.remove_page(child_page_id).await?;
-                    branch.remove(child_idx, free_list).await?;
+                let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
+                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
+                if self.remove_internal(child_node_buffer, key).await? {
+                    self.free_list.remove_page(child_page_id).await?;
+                    branch.remove(child_idx, self.free_list).await?;
                     Ok(branch.num_pairs() == 0 && branch.right_child().is_none())
                 } else {
                     Ok(false)
@@ -388,12 +369,9 @@ impl BTree {
         }
     }
 
-    pub async fn remove(&self, key: &[u8], free_list: &FreeList) -> Result<(), RemoveError> {
-        let root_page = self.fetch_root_page(free_list).await?;
-        if self
-            .remove_internal(root_page.clone(), key, free_list)
-            .await?
-        {
+    pub async fn remove(&self, key: &[u8]) -> Result<(), RemoveError> {
+        let root_page = self.fetch_root_page().await?;
+        if self.remove_internal(root_page.clone(), key).await? {
             let mut root_buffer_lock = root_page.page.write().await;
             let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
             root.initialize_as_leaf();
@@ -466,25 +444,13 @@ mod tests {
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
         let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
         let btree = BTree::create(&free_list).await.unwrap();
-        btree
-            .insert(&6u64.to_be_bytes(), b"world", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&3u64.to_be_bytes(), b"hello", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&8u64.to_be_bytes(), b"!", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&4u64.to_be_bytes(), b",", &free_list)
-            .await
-            .unwrap();
+        btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
+        btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
+        btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
+        btree.insert(&4u64.to_be_bytes(), b",").await.unwrap();
 
         let (_, value) = btree
-            .search(SearchMode::Key(3u64.to_be_bytes().to_vec()), &free_list)
+            .search(SearchMode::Key(3u64.to_be_bytes().to_vec()))
             .await
             .unwrap()
             .get()
@@ -493,7 +459,7 @@ mod tests {
             .unwrap();
         assert_eq!(b"hello", &value[..]);
         let (_, value) = btree
-            .search(SearchMode::Key(8u64.to_be_bytes().to_vec()), &free_list)
+            .search(SearchMode::Key(8u64.to_be_bytes().to_vec()))
             .await
             .unwrap()
             .get()
@@ -513,28 +479,25 @@ mod tests {
         let btree = BTree::create(&free_list).await.unwrap();
         let long_padding = vec![0xDEu8; 1500];
         btree
-            .insert(&6u64.to_be_bytes(), &long_padding, &free_list)
+            .insert(&6u64.to_be_bytes(), &long_padding)
             .await
             .unwrap();
         btree
-            .insert(&3u64.to_be_bytes(), &long_padding, &free_list)
+            .insert(&3u64.to_be_bytes(), &long_padding)
             .await
             .unwrap();
         btree
-            .insert(&8u64.to_be_bytes(), &long_padding, &free_list)
+            .insert(&8u64.to_be_bytes(), &long_padding)
             .await
             .unwrap();
         btree
-            .insert(&4u64.to_be_bytes(), &long_padding, &free_list)
+            .insert(&4u64.to_be_bytes(), &long_padding)
             .await
             .unwrap();
-        btree
-            .insert(&5u64.to_be_bytes(), b"hello", &free_list)
-            .await
-            .unwrap();
+        btree.insert(&5u64.to_be_bytes(), b"hello").await.unwrap();
 
         let (_, value) = btree
-            .search(SearchMode::Key(5u64.to_be_bytes().to_vec()), &free_list)
+            .search(SearchMode::Key(5u64.to_be_bytes().to_vec()))
             .await
             .unwrap()
             .get()
@@ -552,28 +515,16 @@ mod tests {
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
         let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
         let btree = BTree::create(&free_list).await.unwrap();
-        btree
-            .insert(&6u64.to_be_bytes(), b"world", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&3u64.to_be_bytes(), b"hello", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&8u64.to_be_bytes(), b"!", &free_list)
-            .await
-            .unwrap();
-        btree
-            .insert(&4u64.to_be_bytes(), b",", &free_list)
-            .await
-            .unwrap();
+        btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
+        btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
+        btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
+        btree.insert(&4u64.to_be_bytes(), b",").await.unwrap();
 
-        btree.remove(&6u64.to_be_bytes(), &free_list).await.unwrap();
-        btree.remove(&4u64.to_be_bytes(), &free_list).await.unwrap();
+        btree.remove(&6u64.to_be_bytes()).await.unwrap();
+        btree.remove(&4u64.to_be_bytes()).await.unwrap();
 
         let (_, value) = btree
-            .search(SearchMode::Key(3u64.to_be_bytes().to_vec()), &free_list)
+            .search(SearchMode::Key(3u64.to_be_bytes().to_vec()))
             .await
             .unwrap()
             .get()
@@ -582,7 +533,7 @@ mod tests {
             .unwrap();
         assert_eq!(b"hello", &value[..]);
         let (_, value) = btree
-            .search(SearchMode::Key(8u64.to_be_bytes().to_vec()), &free_list)
+            .search(SearchMode::Key(8u64.to_be_bytes().to_vec()))
             .await
             .unwrap()
             .get()
@@ -621,18 +572,18 @@ mod tests {
                         rng.fill(value.as_mut_slice());
                         value
                     };
-                    btree.insert(&key, &value, &free_list).await.unwrap();
+                    btree.insert(&key, &value).await.unwrap();
                     assert!(memory.insert(key, value).is_none());
                 }
                 _ => {
                     if let Some(key) = memory.keys().choose(&mut rng).cloned() {
                         memory.remove(&key).unwrap();
-                        btree.remove(key.as_slice(), &free_list).await.unwrap();
+                        btree.remove(key.as_slice()).await.unwrap();
                     }
                 }
             }
 
-            let mut iter = btree.search(SearchMode::Start, &free_list).await.unwrap();
+            let mut iter = btree.search(SearchMode::Start).await.unwrap();
             let mut snapshot: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
 
             while let Some((key, value)) = iter.next().await.unwrap() {
@@ -642,7 +593,7 @@ mod tests {
             assert_eq!(snapshot, memory);
             for (k, v) in memory.iter() {
                 let (bk, bv) = btree
-                    .search(SearchMode::Key(k.clone()), &free_list)
+                    .search(SearchMode::Key(k.clone()))
                     .await
                     .unwrap()
                     .get()
@@ -681,14 +632,14 @@ mod tests {
                 rng.fill(value.as_mut_slice());
                 value
             };
-            btree.insert(&key, &value, &free_list).await.unwrap();
+            btree.insert(&key, &value).await.unwrap();
             assert!(keys.insert(key));
 
             let mut heights = Vec::new();
 
             for k in keys.iter() {
                 let (_, height) = btree
-                    .search_height(SearchMode::Key(k.clone()), &free_list)
+                    .search_height(SearchMode::Key(k.clone()))
                     .await
                     .unwrap();
                 heights.push(height);
@@ -729,12 +680,12 @@ mod tests {
                         rng.fill(value.as_mut_slice());
                         value
                     };
-                    btree.insert(&key, &value, &free_list).await.unwrap();
+                    btree.insert(&key, &value).await.unwrap();
                     assert!(keys.insert(key));
                 }
                 _ => {
                     if let Some(k) = keys.iter().choose(&mut rng).cloned() {
-                        btree.remove(&k, &free_list).await.unwrap();
+                        btree.remove(&k).await.unwrap();
                         assert!(keys.remove(&k));
                     }
                 }
@@ -744,7 +695,7 @@ mod tests {
 
             for k in keys.iter() {
                 let (_, height) = btree
-                    .search_height(SearchMode::Key(k.clone()), &free_list)
+                    .search_height(SearchMode::Key(k.clone()))
                     .await
                     .unwrap();
                 heights.push(height);
