@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use haneru::btree::BTree;
 use haneru::buffer::BufferPoolManager;
 use haneru::disk::DiskManager;
+use haneru::{btree::BTree, freelist::FreeList};
 
 use rand::prelude::*;
 use tempfile::NamedTempFile;
@@ -16,7 +16,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             let disk_manager = DiskManager::open(&path).unwrap();
             let buffer_pool_manager = BufferPoolManager::new(disk_manager, 256);
-            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+            let btree = BTree::create(&free_list).await.unwrap();
             let mut rng = StdRng::from_seed([0xDE; 32]);
 
             for _ in 0..512 {
@@ -31,7 +32,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     value
                 };
 
-                let _ = btree.insert(&key, &value).await;
+                let _ = btree.insert(&key, &value, &free_list).await;
             }
         })
     });
@@ -42,7 +43,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             let disk_manager = DiskManager::open(&path).unwrap();
             let buffer_pool_manager = BufferPoolManager::new(disk_manager, 512);
-            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+            let btree = BTree::create(&free_list).await.unwrap();
             let mut rng = StdRng::from_seed([0xDE; 32]);
 
             for _ in 0..64 {
@@ -57,7 +59,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     value
                 };
 
-                let _ = btree.insert(&key, &value).await;
+                let _ = btree.insert(&key, &value, &free_list).await;
             }
         })
     });
@@ -68,7 +70,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             let disk_manager = DiskManager::open(&path).unwrap();
             let buffer_pool_manager = BufferPoolManager::new(disk_manager, 256);
-            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+            let btree = BTree::create(&free_list).await.unwrap();
             let mut rng = StdRng::from_seed([0xDE; 32]);
             let mut keys: BTreeSet<Vec<u8>> = Default::default();
 
@@ -88,13 +91,13 @@ fn criterion_benchmark(c: &mut Criterion) {
                             value
                         };
 
-                        let _ = btree.insert(&key, &value).await;
+                        let _ = btree.insert(&key, &value, &free_list).await;
                         keys.insert(key);
                     }
                     _ => {
                         // remove
                         if let Some(key) = keys.iter().choose(&mut rng).cloned() {
-                            btree.remove(&key).await.unwrap();
+                            btree.remove(&key, &free_list).await.unwrap();
                             keys.remove(&key);
                         }
                     }
@@ -109,7 +112,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             let disk_manager = DiskManager::open(&path).unwrap();
             let buffer_pool_manager = BufferPoolManager::new(disk_manager, 512);
-            let btree = BTree::create(buffer_pool_manager).await.unwrap();
+            let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+            let btree = BTree::create(&free_list).await.unwrap();
             let mut rng = StdRng::from_seed([0xDE; 32]);
             let mut keys: BTreeSet<Vec<u8>> = Default::default();
 
@@ -129,13 +133,13 @@ fn criterion_benchmark(c: &mut Criterion) {
                             value
                         };
 
-                        let _ = btree.insert(&key, &value).await;
+                        let _ = btree.insert(&key, &value, &free_list).await;
                         keys.insert(key);
                     }
                     _ => {
                         // remove
                         if let Some(key) = keys.iter().choose(&mut rng).cloned() {
-                            btree.remove(&key).await.unwrap();
+                            btree.remove(&key, &free_list).await.unwrap();
                             keys.remove(&key);
                         }
                     }
