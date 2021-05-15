@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod disk;
 pub mod freelist;
 pub mod memcmpable;
+pub mod query;
 pub mod slotted;
 pub mod slotted_overflow;
 pub mod stack;

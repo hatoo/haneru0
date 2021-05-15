@@ -77,7 +77,7 @@ impl SearchMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct BTree<'a> {
     pub meta_page_id: PageId,
     free_list: &'a FreeList,
@@ -409,18 +409,21 @@ impl<'a> Iter<'a> {
     #[allow(clippy::type_complexity)]
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
         let value = self.get().await?;
-        self.slot_id += 1;
 
-        let buffer = self.buffer.clone();
-        let buffer_lock = buffer.page.read().await;
-        let leaf_node = node::Node::new(buffer_lock.as_bytes());
-        let leaf = leaf::Leaf::new(leaf_node.body);
+        if value.is_some() {
+            self.slot_id += 1;
 
-        if self.slot_id >= leaf.num_pairs() {
-            if let Some(page_id) = leaf.next_page_id() {
-                let buffer = self.free_list.fetch_page(page_id).await?;
-                self.buffer = buffer;
-                self.slot_id = 0;
+            let buffer = self.buffer.clone();
+            let buffer_lock = buffer.page.read().await;
+            let leaf_node = node::Node::new(buffer_lock.as_bytes());
+            let leaf = leaf::Leaf::new(leaf_node.body);
+
+            if self.slot_id >= leaf.num_pairs() {
+                if let Some(page_id) = leaf.next_page_id() {
+                    let buffer = self.free_list.fetch_page(page_id).await?;
+                    self.buffer = buffer;
+                    self.slot_id = 0;
+                }
             }
         }
 
