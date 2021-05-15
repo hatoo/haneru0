@@ -78,6 +78,7 @@ impl From<&[u8]> for PageId {
     }
 }
 
+#[derive(Debug)]
 pub struct DiskManager {
     heap_file: File,
     ring: rio::Rio,

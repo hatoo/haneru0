@@ -77,6 +77,7 @@ impl SearchMode {
     }
 }
 
+#[derive(Debug)]
 pub struct BTree<'a> {
     pub meta_page_id: PageId,
     free_list: &'a FreeList,

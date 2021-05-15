@@ -27,6 +27,7 @@ struct FreePage<B> {
     stack: Stack<B, PageId>,
 }
 
+#[derive(Debug)]
 pub struct FreeList {
     meta_page_id: PageId,
     buffer_pool_manager: BufferPoolManager,
