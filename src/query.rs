@@ -200,3 +200,52 @@ impl<'a> Executor for ExecIndexOnlyScan<'a> {
         Ok(Some(tuple))
     }
 }
+
+#[cfg(test)]
+mod test {
+    use tempfile::NamedTempFile;
+
+    use crate::buffer::BufferPoolManager;
+    use crate::disk::DiskManager;
+    use crate::freelist::FreeList;
+    use crate::table::SimpleTable;
+
+    use super::*;
+    #[tokio::test]
+    async fn test_seq_scan() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+
+        let disk_manager = DiskManager::open(&path).unwrap();
+        let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
+
+        let table = SimpleTable {
+            num_key_elems: 1,
+            btree,
+        };
+
+        table.insert(&[b"hello0", b"world0"]).await.unwrap();
+        table.insert(&[b"hello1", b"world1"]).await.unwrap();
+
+        let seq_scan = SeqScan {
+            btree,
+            search_mode: TupleSearchMode::Start,
+            while_cond: &|_| true,
+        };
+
+        let mut executor = seq_scan.start().await.unwrap();
+
+        assert_eq!(
+            executor.next().await.unwrap(),
+            Some(vec![b"hello0".to_vec(), b"world0".to_vec()])
+        );
+
+        assert_eq!(
+            executor.next().await.unwrap(),
+            Some(vec![b"hello1".to_vec(), b"world1".to_vec()])
+        );
+
+        assert_eq!(executor.next().await.unwrap(), None);
+    }
+}
