@@ -334,60 +334,131 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    #[async_recursion]
-    async fn remove_internal(&self, buffer: Arc<Buffer>, key: &[u8]) -> Result<bool, RemoveError> {
-        let mut buffer_lock = buffer.page.write().await;
-        let node = node::Node::new(buffer_lock.as_bytes_mut());
-        match node::Body::new(node.header.node_type, node.body) {
-            node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
-                    Ok(slot_id) => slot_id,
-                    Err(_) => return Err(RemoveError::KeyNotFound),
-                };
-                leaf.remove(slot_id, self.free_list).await?;
-                if leaf.num_pairs() == 0 {
-                    if let Some(prev_page_id) = leaf.prev_page_id() {
-                        let prev_page_buffer = self.free_list.fetch_page(prev_page_id).await?;
-                        let mut prev_page_lock = prev_page_buffer.page.write().await;
-                        let prev_page = node::Node::new(prev_page_lock.as_bytes_mut());
-                        let mut prev_leaf = leaf::Leaf::new(prev_page.body);
-                        prev_leaf.set_next_page_id(leaf.next_page_id());
-                    }
-                    if let Some(next_page_id) = leaf.next_page_id() {
-                        let next_page_buffer = self.free_list.fetch_page(next_page_id).await?;
-                        let mut next_page_lock = next_page_buffer.page.write().await;
-                        let next_page = node::Node::new(next_page_lock.as_bytes_mut());
-                        let mut next_leaf = leaf::Leaf::new(next_page.body);
-                        next_leaf.set_prev_page_id(leaf.prev_page_id());
-                    }
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, self.free_list).await?;
-                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
-                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
-                if self.remove_internal(child_node_buffer, key).await? {
-                    self.free_list.remove_page(child_page_id).await?;
-                    branch.remove(child_idx, self.free_list).await?;
-                    Ok(branch.num_pairs() == 0 && branch.right_child().is_none())
-                } else {
-                    Ok(false)
-                }
-            }
-        }
-    }
-
     pub async fn remove(&self, key: &[u8]) -> Result<(), RemoveError> {
-        let root_page = self.fetch_root_page().await?;
-        if self.remove_internal(root_page.clone(), key).await? {
-            let mut root_buffer_lock = root_page.page.write().await;
-            let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
-            root.initialize_as_leaf();
-            let mut leaf = leaf::Leaf::new(root.body);
-            leaf.initialize();
+        let mut buffer_lock = WithWriteLockGuard::new(self.fetch_root_page().await?).await;
+        let root_page_id = buffer_lock.page_id();
+        let mut shrink_stack: Vec<(WithWriteLockGuard, usize)> = Vec::new();
+
+        loop {
+            let node = node::Node::new(buffer_lock.as_bytes_mut());
+            match node::Body::new(node.header.node_type, node.body) {
+                node::Body::Leaf(mut leaf) => {
+                    let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
+                        Ok(slot_id) => slot_id,
+                        Err(_) => return Err(RemoveError::KeyNotFound),
+                    };
+
+                    leaf.remove(slot_id, self.free_list).await?;
+                    if leaf.num_pairs() == 0 {
+                        let modified_siblings = match (leaf.prev_page_id(), leaf.next_page_id()) {
+                            (Some(prev_page_id), Some(next_page_id)) => {
+                                let prev_page_buffer =
+                                    self.free_list.fetch_page(prev_page_id).await?;
+                                let next_page_buffer =
+                                    self.free_list.fetch_page(next_page_id).await?;
+
+                                if let (Some(mut prev_page_lock), Some(mut next_page_lock)) = (
+                                    WithWriteLockGuard::try_new(prev_page_buffer),
+                                    WithWriteLockGuard::try_new(next_page_buffer),
+                                ) {
+                                    let prev_page = node::Node::new(prev_page_lock.as_bytes_mut());
+                                    let mut prev_leaf = leaf::Leaf::new(prev_page.body);
+                                    prev_leaf.set_next_page_id(leaf.next_page_id());
+
+                                    let next_page = node::Node::new(next_page_lock.as_bytes_mut());
+                                    let mut next_leaf = leaf::Leaf::new(next_page.body);
+                                    next_leaf.set_prev_page_id(leaf.prev_page_id());
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            (Some(prev_page_id), None) => {
+                                let prev_page_buffer =
+                                    self.free_list.fetch_page(prev_page_id).await?;
+
+                                let mut prev_page_lock =
+                                    WithWriteLockGuard::new(prev_page_buffer).await;
+                                let prev_page = node::Node::new(prev_page_lock.as_bytes_mut());
+                                let mut prev_leaf = leaf::Leaf::new(prev_page.body);
+                                prev_leaf.set_next_page_id(leaf.next_page_id());
+                                true
+                            }
+                            (None, Some(next_page_id)) => {
+                                let next_page_buffer =
+                                    self.free_list.fetch_page(next_page_id).await?;
+
+                                if let Some(mut next_page_lock) =
+                                    WithWriteLockGuard::try_new(next_page_buffer)
+                                {
+                                    let next_page = node::Node::new(next_page_lock.as_bytes_mut());
+                                    let mut next_leaf = leaf::Leaf::new(next_page.body);
+                                    next_leaf.set_prev_page_id(leaf.prev_page_id());
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            (None, None) => true,
+                        };
+
+                        if modified_siblings {
+                            if buffer_lock.page_id() == root_page_id {
+                                let mut node = node::Node::new(buffer_lock.as_bytes_mut());
+                                node.initialize_as_leaf();
+                                let mut leaf = leaf::Leaf::new(node.body);
+                                leaf.initialize();
+                            } else {
+                                let leaf_page_id = buffer_lock.page_id();
+                                drop(buffer_lock);
+                                self.free_list.remove_page(leaf_page_id).await?;
+
+                                loop {
+                                    let (mut lock, child_idx) = shrink_stack.pop().unwrap();
+                                    let lock_page_id = lock.page_id();
+                                    let node = node::Node::new(lock.as_bytes_mut());
+                                    let mut branch = Branch::new(node.body);
+
+                                    branch.remove(child_idx, &self.free_list).await?;
+
+                                    if branch.num_pairs() == 0 && branch.right_child().is_none() {
+                                        if lock_page_id == root_page_id {
+                                            drop(branch);
+                                            let mut node = node::Node::new(lock.as_bytes_mut());
+                                            node.initialize_as_leaf();
+                                            let mut leaf = leaf::Leaf::new(node.body);
+                                            leaf.initialize();
+                                            break;
+                                        } else {
+                                            drop(branch);
+                                            drop(lock);
+                                            self.free_list.remove_page(lock_page_id).await?;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    break;
+                }
+                node::Body::Branch(branch) => {
+                    let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                    let child_page_id = branch.child_at(child_idx, self.free_list).await?;
+                    let child_node_buffer =
+                        WithWriteLockGuard::new(self.free_list.fetch_page(child_page_id).await?)
+                            .await;
+
+                    if branch.num_pairs() + branch.right_child().map(|_| 1).unwrap_or(0) > 1 {
+                        shrink_stack.clear();
+                    }
+
+                    shrink_stack.push((buffer_lock, child_idx));
+                    buffer_lock = child_node_buffer;
+                }
+            }
         }
 
         Ok(())

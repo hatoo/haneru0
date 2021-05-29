@@ -78,6 +78,15 @@ impl WithWriteLockGuard {
         }
     }
 
+    pub fn try_new(buffer: Arc<Buffer>) -> Option<Self> {
+        let lock = buffer
+            .page
+            .try_write()
+            .map(|lock| unsafe { std::mem::transmute(lock) });
+
+        lock.map(|lock| Self { lock, buffer })
+    }
+
     pub fn into_inner(self) -> Arc<Buffer> {
         self.buffer
     }
