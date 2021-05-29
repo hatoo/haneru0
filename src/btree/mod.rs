@@ -1,14 +1,16 @@
-use std::{convert::identity, sync::Arc};
+use std::{convert::identity, mem::size_of, sync::Arc};
 
 use async_recursion::async_recursion;
-use bincode::Options;
+use byteorder::{ByteOrder, NativeEndian};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zerocopy::{AsBytes, ByteSlice};
 
-use crate::buffer::{self, Buffer};
+use crate::buffer::{self, Buffer, WithReadLockGuard, WithWriteLockGuard};
 use crate::disk::PageId;
 use crate::freelist::FreeList;
+
+use self::branch::Branch;
 
 pub mod branch;
 pub mod leaf;
@@ -23,11 +25,22 @@ pub struct Pair<'a> {
 
 impl<'a> Pair<'a> {
     fn to_bytes(&self) -> Vec<u8> {
-        bincode::options().serialize(self).unwrap()
+        let mut buf = Vec::with_capacity(size_of::<u64>() + self.key.len() + self.value.len());
+        buf.extend_from_slice(&[0; size_of::<u64>()]);
+        NativeEndian::write_u64(&mut buf, self.key.len() as u64);
+        buf.extend_from_slice(self.key);
+        buf.extend_from_slice(self.value);
+        buf
     }
 
     fn from_bytes(bytes: &'a [u8]) -> Self {
-        bincode::options().deserialize(bytes).unwrap()
+        let len = NativeEndian::read_u64(&bytes[..size_of::<u64>()]) as usize;
+        let body = &bytes[size_of::<u64>()..];
+
+        Self {
+            key: &body[..len],
+            value: &body[len..],
+        }
     }
 }
 
@@ -123,8 +136,7 @@ impl<'a> BTree<'a> {
     }
 
     pub async fn search(&self, search_mode: SearchMode) -> Result<Iter<'_>, buffer::Error> {
-        let mut node_buffer_lock =
-            buffer::WithReadLockGuard::new(self.fetch_root_page().await?).await;
+        let mut node_buffer_lock = WithReadLockGuard::new(self.fetch_root_page().await?).await;
 
         loop {
             let node = node::Node::new(node_buffer_lock.as_bytes());
@@ -143,10 +155,9 @@ impl<'a> BTree<'a> {
                 }
                 node::Body::Branch(branch) => {
                     let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
-                    let lock = buffer::WithReadLockGuard::new(
-                        self.free_list.fetch_page(child_page_id).await?,
-                    )
-                    .await;
+                    let lock =
+                        WithReadLockGuard::new(self.free_list.fetch_page(child_page_id).await?)
+                            .await;
 
                     node_buffer_lock = lock;
                 }
@@ -159,8 +170,7 @@ impl<'a> BTree<'a> {
         &self,
         search_mode: SearchMode,
     ) -> Result<(Iter<'_>, usize), buffer::Error> {
-        let mut node_buffer_lock =
-            buffer::WithReadLockGuard::new(self.fetch_root_page().await?).await;
+        let mut node_buffer_lock = WithReadLockGuard::new(self.fetch_root_page().await?).await;
         let mut height = 0;
 
         loop {
@@ -183,10 +193,9 @@ impl<'a> BTree<'a> {
                 }
                 node::Body::Branch(branch) => {
                     let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
-                    let lock = buffer::WithReadLockGuard::new(
-                        self.free_list.fetch_page(child_page_id).await?,
-                    )
-                    .await;
+                    let lock =
+                        WithReadLockGuard::new(self.free_list.fetch_page(child_page_id).await?)
+                            .await;
 
                     node_buffer_lock = lock;
 
@@ -196,105 +205,119 @@ impl<'a> BTree<'a> {
         }
     }
 
-    #[async_recursion]
-    async fn insert_internal(
-        &self,
-        buffer: Arc<Buffer>,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<Option<(Vec<u8>, PageId)>, InsertError> {
-        let mut buffer_lock = buffer.page.write().await;
-        let node = node::Node::new(buffer_lock.as_bytes_mut());
-        match node::Body::new(node.header.node_type, node.body) {
-            node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
-                    Ok(_) => return Err(InsertError::DuplicateKey),
-                    Err(slot_id) => slot_id,
-                };
-                if leaf
-                    .insert(slot_id, key, value, self.free_list)
-                    .await?
-                    .is_some()
-                {
-                    Ok(None)
-                } else {
-                    let prev_leaf_page_id = leaf.prev_page_id();
-                    let prev_leaf_buffer = if let Some(next_leaf_page_id) = prev_leaf_page_id {
-                        Some(self.free_list.fetch_page(next_leaf_page_id).await)
-                    } else {
-                        None
-                    }
-                    .transpose()?;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
+        let buffer = self.fetch_root_page().await?;
+        let root_page_id = buffer.page_id;
+        let mut buffer_lock = WithWriteLockGuard::new(buffer).await;
+        let mut overflow_stack: Vec<(WithWriteLockGuard, usize)> = Vec::new();
 
-                    let new_leaf_buffer = self.free_list.new_page().await?;
-
-                    if let Some(prev_leaf_buffer) = prev_leaf_buffer {
-                        let mut prev_leaf_buffer_lock = prev_leaf_buffer.page.write().await;
-                        let node = node::Node::new(prev_leaf_buffer_lock.as_bytes_mut());
-                        let mut prev_leaf = leaf::Leaf::new(node.body);
-                        prev_leaf.set_next_page_id(Some(new_leaf_buffer.page_id));
-                    }
-                    leaf.set_prev_page_id(Some(new_leaf_buffer.page_id));
-
-                    let mut new_leaf_buffer_lock = new_leaf_buffer.page.write().await;
-                    let mut new_leaf_node = node::Node::new(new_leaf_buffer_lock.as_bytes_mut());
-                    new_leaf_node.initialize_as_leaf();
-                    let mut new_leaf = leaf::Leaf::new(new_leaf_node.body);
-                    new_leaf.initialize();
-                    let overflow_key = leaf
-                        .split_insert(&mut new_leaf, key, value, self.free_list)
-                        .await?;
-                    new_leaf.set_next_page_id(Some(buffer.page_id));
-                    new_leaf.set_prev_page_id(prev_leaf_page_id);
-                    Ok(Some((overflow_key, new_leaf_buffer.page_id)))
-                }
-            }
-            node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, self.free_list).await?;
-                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
-                let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
-                if let Some((overflow_key_from_child, overflow_child_page_id)) =
-                    self.insert_internal(child_node_buffer, key, value).await?
-                {
-                    if branch
-                        .insert(
-                            child_idx,
-                            &overflow_key_from_child,
-                            overflow_child_page_id,
-                            self.free_list,
-                        )
+        let new_root = loop {
+            let node = node::Node::new(buffer_lock.as_bytes_mut());
+            match node::Body::new(node.header.node_type, node.body) {
+                node::Body::Leaf(mut leaf) => {
+                    let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
+                        Ok(_) => return Err(InsertError::DuplicateKey),
+                        Err(slot_id) => slot_id,
+                    };
+                    if leaf
+                        .insert(slot_id, key, value, self.free_list)
                         .await?
                         .is_some()
                     {
-                        Ok(None)
+                        overflow_stack.clear();
+                        break None;
                     } else {
-                        let new_branch_buffer = self.free_list.new_page().await?;
-                        let mut new_branch_buffer_lock = new_branch_buffer.page.write().await;
-                        let mut new_branch_node =
-                            node::Node::new(new_branch_buffer_lock.as_bytes_mut());
-                        new_branch_node.initialize_as_branch();
-                        let mut new_branch = branch::Branch::new(new_branch_node.body);
-                        let overflow_key = branch
-                            .split_insert(
-                                &mut new_branch,
-                                &overflow_key_from_child,
-                                overflow_child_page_id,
-                                self.free_list,
-                            )
+                        let prev_leaf_page_id = leaf.prev_page_id();
+                        let prev_leaf_buffer = if let Some(next_leaf_page_id) = prev_leaf_page_id {
+                            Some(self.free_list.fetch_page(next_leaf_page_id).await)
+                        } else {
+                            None
+                        }
+                        .transpose()?;
+
+                        let new_leaf_buffer = self.free_list.new_page().await?;
+
+                        if let Some(prev_leaf_buffer) = prev_leaf_buffer {
+                            let mut prev_leaf_buffer_lock = prev_leaf_buffer.page.write().await;
+                            let node = node::Node::new(prev_leaf_buffer_lock.as_bytes_mut());
+                            let mut prev_leaf = leaf::Leaf::new(node.body);
+                            prev_leaf.set_next_page_id(Some(new_leaf_buffer.page_id));
+                        }
+                        leaf.set_prev_page_id(Some(new_leaf_buffer.page_id));
+
+                        let mut new_leaf_buffer_lock = new_leaf_buffer.page.write().await;
+                        let mut new_leaf_node =
+                            node::Node::new(new_leaf_buffer_lock.as_bytes_mut());
+                        new_leaf_node.initialize_as_leaf();
+                        let mut new_leaf = leaf::Leaf::new(new_leaf_node.body);
+                        new_leaf.initialize();
+                        let overflow_key = leaf
+                            .split_insert(&mut new_leaf, key, value, self.free_list)
                             .await?;
-                        Ok(Some((overflow_key, new_branch_buffer.page_id)))
+                        new_leaf.set_next_page_id(Some(buffer_lock.page_id()));
+                        new_leaf.set_prev_page_id(prev_leaf_page_id);
+
+                        let mut overflow_key = overflow_key;
+                        let mut overflow_page_id = new_leaf_buffer.page_id;
+
+                        if buffer_lock.page_id() == root_page_id {
+                            break Some((buffer_lock, overflow_key, overflow_page_id));
+                        }
+
+                        break loop {
+                            let (mut lock, child_idx) = overflow_stack.pop().unwrap();
+                            let node = node::Node::new(lock.as_bytes_mut());
+                            let mut branch = Branch::new(node.body);
+
+                            if branch
+                                .insert(child_idx, &overflow_key, overflow_page_id, self.free_list)
+                                .await?
+                                .is_some()
+                            {
+                                break None;
+                            } else {
+                                let new_branch_buffer = self.free_list.new_page().await?;
+                                let mut new_branch_buffer_lock =
+                                    new_branch_buffer.page.write().await;
+                                let mut new_branch_node =
+                                    node::Node::new(new_branch_buffer_lock.as_bytes_mut());
+                                new_branch_node.initialize_as_branch();
+                                let mut new_branch = branch::Branch::new(new_branch_node.body);
+                                overflow_key = branch
+                                    .split_insert(
+                                        &mut new_branch,
+                                        &overflow_key,
+                                        overflow_page_id,
+                                        self.free_list,
+                                    )
+                                    .await?;
+                                overflow_page_id = new_branch_buffer.page_id;
+
+                                if lock.page_id() == root_page_id {
+                                    break Some((lock, overflow_key, overflow_page_id));
+                                }
+                            }
+                        };
                     }
-                } else {
-                    Ok(None)
+                }
+                node::Body::Branch(branch) => {
+                    let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                    let child_page_id = branch.child_at(child_idx, self.free_list).await?;
+                    let child_node_buffer =
+                        WithWriteLockGuard::new(self.free_list.fetch_page(child_page_id).await?)
+                            .await;
+
+                    if !branch.may_overflow() {
+                        overflow_stack.clear();
+                    }
+
+                    overflow_stack.push((buffer_lock, child_idx));
+                    buffer_lock = child_node_buffer;
                 }
             }
-        }
-    }
+        };
 
-    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), InsertError> {
-        let root_buffer = self.fetch_root_page().await?;
-        let root_page_id = root_buffer.page_id;
-        if let Some((key, child_page_id)) = self.insert_internal(root_buffer, key, value).await? {
+        if let Some((_root_lock, key, child_page_id)) = new_root {
             let new_root_buffer = self.free_list.new_page().await?;
             let mut new_root_buffer_lock = new_root_buffer.page.write().await;
             let mut node = node::Node::new(new_root_buffer_lock.as_bytes_mut());

@@ -64,6 +64,43 @@ impl Deref for WithReadLockGuard {
     }
 }
 
+pub struct WithWriteLockGuard {
+    buffer: Arc<Buffer>,
+    lock: RwLockWriteGuard<'static, Page>,
+}
+
+impl WithWriteLockGuard {
+    pub async fn new(buffer: Arc<Buffer>) -> Self {
+        let lock = buffer.page.write().await;
+        Self {
+            lock: unsafe { std::mem::transmute(lock) },
+            buffer,
+        }
+    }
+
+    pub fn into_inner(self) -> Arc<Buffer> {
+        self.buffer
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.buffer.page_id
+    }
+}
+
+impl Deref for WithWriteLockGuard {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        self.lock.deref()
+    }
+}
+
+impl DerefMut for WithWriteLockGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.lock.deref_mut()
+    }
+}
+
 #[derive(Debug)]
 struct Frame<T> {
     usage_count: AtomicU64,
