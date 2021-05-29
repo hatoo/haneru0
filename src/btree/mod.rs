@@ -122,80 +122,34 @@ impl<'a> BTree<'a> {
         Ok(self.free_list.fetch_page(root_page_id).await?)
     }
 
-    #[async_recursion]
-    async fn search_internal(
-        &self,
-        node_buffer: Arc<Buffer>,
-        search_mode: SearchMode,
-    ) -> Result<Iter<'_>, buffer::Error> {
-        let node_buffer_lock = node_buffer.page.read().await;
-        let node = node::Node::new(node_buffer_lock.as_bytes());
-        match node::Body::new(node.header.node_type, node.body.as_bytes()) {
-            node::Body::Leaf(leaf) => {
-                let slot_id = search_mode
-                    .tuple_slot_id(&leaf, self.free_list)
-                    .await?
-                    .unwrap_or_else(identity);
-                drop(node);
-                drop(node_buffer_lock);
-                Ok(Iter {
-                    free_list: self.free_list,
-                    buffer: node_buffer,
-                    slot_id,
-                })
-            }
-            node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
-                drop(node);
-                drop(node_buffer_lock);
-                drop(node_buffer);
-                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
-                self.search_internal(child_node_page, search_mode).await
-            }
-        }
-    }
-
     pub async fn search(&self, search_mode: SearchMode) -> Result<Iter<'_>, buffer::Error> {
-        let root_page = self.fetch_root_page().await?;
-        self.search_internal(root_page, search_mode).await
-    }
+        let mut node_buffer_lock =
+            buffer::WithReadLockGuard::new(self.fetch_root_page().await?).await;
 
-    #[cfg(test)]
-    #[async_recursion]
-    async fn search_internal_height(
-        &self,
-        node_buffer: Arc<Buffer>,
-        search_mode: SearchMode,
-    ) -> Result<(Iter<'_>, usize), buffer::Error> {
-        let node_buffer_lock = node_buffer.page.read().await;
-        let node = node::Node::new(node_buffer_lock.as_bytes());
-        match node::Body::new(node.header.node_type, node.body.as_bytes()) {
-            node::Body::Leaf(leaf) => {
-                let slot_id = search_mode
-                    .tuple_slot_id(&leaf, self.free_list)
-                    .await?
-                    .unwrap_or_else(identity);
-                drop(node);
-                drop(node_buffer_lock);
-                Ok((
-                    Iter {
+        loop {
+            let node = node::Node::new(node_buffer_lock.as_bytes());
+
+            match node::Body::new(node.header.node_type, node.body.as_bytes()) {
+                node::Body::Leaf(leaf) => {
+                    let slot_id = search_mode
+                        .tuple_slot_id(&leaf, self.free_list)
+                        .await?
+                        .unwrap_or_else(identity);
+                    return Ok(Iter {
                         free_list: self.free_list,
-                        buffer: node_buffer,
+                        buffer: node_buffer_lock.into_inner(),
                         slot_id,
-                    },
-                    0,
-                ))
-            }
-            node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
-                drop(node);
-                drop(node_buffer_lock);
-                drop(node_buffer);
-                let child_node_page = self.free_list.fetch_page(child_page_id).await?;
-                let (iter, height) = self
-                    .search_internal_height(child_node_page, search_mode)
-                    .await?;
-                Ok((iter, height + 1))
+                    });
+                }
+                node::Body::Branch(branch) => {
+                    let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
+                    let lock = buffer::WithReadLockGuard::new(
+                        self.free_list.fetch_page(child_page_id).await?,
+                    )
+                    .await;
+
+                    node_buffer_lock = lock;
+                }
             }
         }
     }
@@ -205,8 +159,41 @@ impl<'a> BTree<'a> {
         &self,
         search_mode: SearchMode,
     ) -> Result<(Iter<'_>, usize), buffer::Error> {
-        let root_page = self.fetch_root_page().await?;
-        self.search_internal_height(root_page, search_mode).await
+        let mut node_buffer_lock =
+            buffer::WithReadLockGuard::new(self.fetch_root_page().await?).await;
+        let mut height = 0;
+
+        loop {
+            let node = node::Node::new(node_buffer_lock.as_bytes());
+
+            match node::Body::new(node.header.node_type, node.body.as_bytes()) {
+                node::Body::Leaf(leaf) => {
+                    let slot_id = search_mode
+                        .tuple_slot_id(&leaf, self.free_list)
+                        .await?
+                        .unwrap_or_else(identity);
+                    return Ok((
+                        Iter {
+                            free_list: self.free_list,
+                            buffer: node_buffer_lock.into_inner(),
+                            slot_id,
+                        },
+                        height,
+                    ));
+                }
+                node::Body::Branch(branch) => {
+                    let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
+                    let lock = buffer::WithReadLockGuard::new(
+                        self.free_list.fetch_page(child_page_id).await?,
+                    )
+                    .await;
+
+                    node_buffer_lock = lock;
+
+                    height += 1;
+                }
+            }
+        }
     }
 
     #[async_recursion]
