@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zerocopy::{AsBytes, ByteSlice};
 
-use crate::buffer::{self, Buffer, BufferPoolManager};
+use crate::buffer::{self, Buffer};
 use crate::disk::PageId;
 use crate::freelist::FreeList;
 
@@ -77,37 +77,46 @@ impl SearchMode {
     }
 }
 
-pub struct BTree {
-    free_list: FreeList,
+#[derive(Debug, Copy, Clone)]
+pub struct BTree<'a> {
+    pub meta_page_id: PageId,
+    free_list: &'a FreeList,
 }
 
-impl BTree {
-    pub async fn create(buffer_pool_manager: BufferPoolManager) -> Result<Self, buffer::Error> {
-        let free_list = FreeList::create(buffer_pool_manager).await?;
+impl<'a> BTree<'a> {
+    pub async fn create(free_list: &'a FreeList) -> Result<BTree<'a>, buffer::Error> {
         let root_buffer = free_list.new_page().await?;
         let mut root_buffer_lock = root_buffer.page.write().await;
         let mut root = node::Node::new(root_buffer_lock.as_bytes_mut());
         root.initialize_as_leaf();
         let mut leaf = leaf::Leaf::new(root.body);
         leaf.initialize();
-        let meta_buffer = free_list.fetch_meta_page().await?;
+        let meta_buffer = free_list.new_page().await?;
         let mut meta_buffer_lock = meta_buffer.page.write().await;
-        let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
+        let mut meta = meta::Meta::new(meta_buffer_lock.as_bytes_mut());
         meta.header.root_page_id = root_buffer.page_id;
-        Ok(Self { free_list })
+        Ok(Self {
+            meta_page_id: meta_buffer.page_id,
+            free_list,
+        })
     }
 
-    pub fn new(meta_page_id: PageId, buffer_pool_manager: BufferPoolManager) -> Self {
+    pub fn new(meta_page_id: PageId, free_list: &'a FreeList) -> Self {
         Self {
-            free_list: FreeList::new(meta_page_id, buffer_pool_manager),
+            meta_page_id,
+            free_list,
         }
+    }
+
+    async fn fetch_meta_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
+        Ok(self.free_list.fetch_page(self.meta_page_id).await?)
     }
 
     async fn fetch_root_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
         let root_page_id = {
-            let meta_buffer = self.free_list.fetch_meta_page().await?;
+            let meta_buffer = self.free_list.fetch_page(self.meta_page_id).await?;
             let meta_buffer_lock = meta_buffer.page.read().await;
-            let meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes()));
+            let meta = meta::Meta::new(meta_buffer_lock.as_bytes());
             meta.header.root_page_id
         };
         Ok(self.free_list.fetch_page(root_page_id).await?)
@@ -124,19 +133,19 @@ impl BTree {
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
                 let slot_id = search_mode
-                    .tuple_slot_id(&leaf, &self.free_list)
+                    .tuple_slot_id(&leaf, self.free_list)
                     .await?
                     .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok(Iter {
-                    free_list: &self.free_list,
+                    free_list: self.free_list,
                     buffer: node_buffer,
                     slot_id,
                 })
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, &self.free_list).await?;
+                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
@@ -163,14 +172,14 @@ impl BTree {
         match node::Body::new(node.header.node_type, node.body.as_bytes()) {
             node::Body::Leaf(leaf) => {
                 let slot_id = search_mode
-                    .tuple_slot_id(&leaf, &self.free_list)
+                    .tuple_slot_id(&leaf, self.free_list)
                     .await?
                     .unwrap_or_else(identity);
                 drop(node);
                 drop(node_buffer_lock);
                 Ok((
                     Iter {
-                        free_list: &self.free_list,
+                        free_list: self.free_list,
                         buffer: node_buffer,
                         slot_id,
                     },
@@ -178,7 +187,7 @@ impl BTree {
                 ))
             }
             node::Body::Branch(branch) => {
-                let child_page_id = search_mode.child_page_id(&branch, &self.free_list).await?;
+                let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
                 drop(node);
                 drop(node_buffer_lock);
                 drop(node_buffer);
@@ -211,12 +220,12 @@ impl BTree {
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, &self.free_list).await? {
+                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
                     Ok(_) => return Err(InsertError::DuplicateKey),
                     Err(slot_id) => slot_id,
                 };
                 if leaf
-                    .insert(slot_id, key, value, &self.free_list)
+                    .insert(slot_id, key, value, self.free_list)
                     .await?
                     .is_some()
                 {
@@ -246,7 +255,7 @@ impl BTree {
                     let mut new_leaf = leaf::Leaf::new(new_leaf_node.body);
                     new_leaf.initialize();
                     let overflow_key = leaf
-                        .split_insert(&mut new_leaf, key, value, &self.free_list)
+                        .split_insert(&mut new_leaf, key, value, self.free_list)
                         .await?;
                     new_leaf.set_next_page_id(Some(buffer.page_id));
                     new_leaf.set_prev_page_id(prev_leaf_page_id);
@@ -254,8 +263,8 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, &self.free_list).await?;
-                let child_page_id = branch.child_at(child_idx, &self.free_list).await?;
+                let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
                 let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
                 if let Some((overflow_key_from_child, overflow_child_page_id)) =
                     self.insert_internal(child_node_buffer, key, value).await?
@@ -265,7 +274,7 @@ impl BTree {
                             child_idx,
                             &overflow_key_from_child,
                             overflow_child_page_id,
-                            &self.free_list,
+                            self.free_list,
                         )
                         .await?
                         .is_some()
@@ -283,7 +292,7 @@ impl BTree {
                                 &mut new_branch,
                                 &overflow_key_from_child,
                                 overflow_child_page_id,
-                                &self.free_list,
+                                self.free_list,
                             )
                             .await?;
                         Ok(Some((overflow_key, new_branch_buffer.page_id)))
@@ -305,11 +314,11 @@ impl BTree {
             node.initialize_as_branch();
             let mut branch = branch::Branch::new(node.body);
             branch
-                .initialize(&key, child_page_id, root_page_id, &self.free_list)
+                .initialize(&key, child_page_id, root_page_id, self.free_list)
                 .await?;
-            let meta_buffer = self.free_list.fetch_meta_page().await?;
+            let meta_buffer = self.fetch_meta_page().await?;
             let mut meta_buffer_lock = meta_buffer.page.write().await;
-            let mut meta = meta::Meta::new(FreeList::other_meta(meta_buffer_lock.as_bytes_mut()));
+            let mut meta = meta::Meta::new(meta_buffer_lock.as_bytes_mut());
             meta.header.root_page_id = new_root_buffer.page_id;
         }
         Ok(())
@@ -321,11 +330,11 @@ impl BTree {
         let node = node::Node::new(buffer_lock.as_bytes_mut());
         match node::Body::new(node.header.node_type, node.body) {
             node::Body::Leaf(mut leaf) => {
-                let slot_id = match leaf.search_slot_id(key, &self.free_list).await? {
+                let slot_id = match leaf.search_slot_id(key, self.free_list).await? {
                     Ok(slot_id) => slot_id,
                     Err(_) => return Err(RemoveError::KeyNotFound),
                 };
-                leaf.remove(slot_id, &self.free_list).await?;
+                leaf.remove(slot_id, self.free_list).await?;
                 if leaf.num_pairs() == 0 {
                     if let Some(prev_page_id) = leaf.prev_page_id() {
                         let prev_page_buffer = self.free_list.fetch_page(prev_page_id).await?;
@@ -347,12 +356,12 @@ impl BTree {
                 }
             }
             node::Body::Branch(mut branch) => {
-                let child_idx = branch.search_child_idx(key, &self.free_list).await?;
-                let child_page_id = branch.child_at(child_idx, &self.free_list).await?;
+                let child_idx = branch.search_child_idx(key, self.free_list).await?;
+                let child_page_id = branch.child_at(child_idx, self.free_list).await?;
                 let child_node_buffer = self.free_list.fetch_page(child_page_id).await?;
                 if self.remove_internal(child_node_buffer, key).await? {
                     self.free_list.remove_page(child_page_id).await?;
-                    branch.remove(child_idx, &self.free_list).await?;
+                    branch.remove(child_idx, self.free_list).await?;
                     Ok(branch.num_pairs() == 0 && branch.right_child().is_none())
                 } else {
                     Ok(false)
@@ -383,7 +392,7 @@ pub struct Iter<'a> {
 
 impl<'a> Iter<'a> {
     #[async_recursion]
-    async fn get(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
+    async fn get(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
         let buffer = self.buffer.clone();
         let buffer_lock = buffer.page.read().await;
         let leaf_node = node::Node::new(buffer_lock.as_bytes());
@@ -393,21 +402,31 @@ impl<'a> Iter<'a> {
             let pair = Pair::from_bytes(&data);
             Ok(Some((pair.key.to_vec(), pair.value.to_vec())))
         } else {
-            if let Some(page_id) = leaf.next_page_id() {
-                let buffer = self.free_list.fetch_page(page_id).await?;
-                self.buffer = buffer;
-                self.slot_id = 0;
-                self.get().await
-            } else {
-                Ok(None)
-            }
+            Ok(None)
         }
     }
 
     #[allow(clippy::type_complexity)]
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
         let value = self.get().await?;
-        self.slot_id += 1;
+
+        if value.is_some() {
+            self.slot_id += 1;
+
+            let buffer = self.buffer.clone();
+            let buffer_lock = buffer.page.read().await;
+            let leaf_node = node::Node::new(buffer_lock.as_bytes());
+            let leaf = leaf::Leaf::new(leaf_node.body);
+
+            if self.slot_id >= leaf.num_pairs() {
+                if let Some(page_id) = leaf.next_page_id() {
+                    let buffer = self.free_list.fetch_page(page_id).await?;
+                    self.buffer = buffer;
+                    self.slot_id = 0;
+                }
+            }
+        }
+
         Ok(value)
     }
 }
@@ -427,7 +446,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
         btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
         btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
@@ -459,7 +479,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         let long_padding = vec![0xDEu8; 1500];
         btree
             .insert(&6u64.to_be_bytes(), &long_padding)
@@ -496,7 +517,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 16);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
         btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
         btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
@@ -531,7 +553,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 256);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         let mut memory: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
 
         let mut rng = StdRng::from_seed([0xDE; 32]);
@@ -594,7 +617,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 64);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
 
         let mut rng = StdRng::from_seed([0xDE; 32]);
@@ -638,7 +662,8 @@ mod tests {
 
         let disk_manager = DiskManager::open(&path).unwrap();
         let buffer_pool_manager = BufferPoolManager::new(disk_manager, 64);
-        let btree = BTree::create(buffer_pool_manager).await.unwrap();
+        let free_list = FreeList::create(buffer_pool_manager).await.unwrap();
+        let btree = BTree::create(&free_list).await.unwrap();
         let mut keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
 
         let mut rng = StdRng::from_seed([0xAF; 32]);

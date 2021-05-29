@@ -130,6 +130,7 @@ struct PagePool {
     page_table: std::collections::HashMap<PageId, PageTableItem>,
 }
 
+#[derive(Debug)]
 pub struct BufferPoolManager {
     disk: DiskManager,
     page_pool: RwLock<PagePool>,

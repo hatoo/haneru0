@@ -27,6 +27,7 @@ struct FreePage<B> {
     stack: Stack<B, PageId>,
 }
 
+#[derive(Debug)]
 pub struct FreeList {
     meta_page_id: PageId,
     buffer_pool_manager: BufferPoolManager,
@@ -71,20 +72,12 @@ impl FreeList {
         }
     }
 
-    pub fn other_meta<B: ByteSlice>(bytes: B) -> B {
-        let (_header, body) = LayoutVerified::<B, Header>::new_from_prefix(bytes).unwrap();
-        body
-    }
-
-    pub async fn fetch_meta_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
+    async fn fetch_meta_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
         self.buffer_pool_manager.fetch_page(self.meta_page_id).await
     }
 
     pub async fn new_page(&self) -> Result<Arc<Buffer>, buffer::Error> {
-        let meta_buffer = self
-            .buffer_pool_manager
-            .fetch_page(self.meta_page_id)
-            .await?;
+        let meta_buffer = self.fetch_meta_page().await?;
         let mut meta_buffer_lock = meta_buffer.page.write().await;
 
         let (mut meta, _) =
