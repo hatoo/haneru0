@@ -1,6 +1,5 @@
 use std::{convert::identity, mem::size_of, sync::Arc};
 
-use async_recursion::async_recursion;
 use byteorder::{ByteOrder, NativeEndian};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -62,7 +61,7 @@ pub enum RemoveError {
 
 #[derive(Debug, Clone)]
 pub enum SearchMode {
-    Start,
+    Last,
     Key(Vec<u8>),
 }
 
@@ -73,7 +72,7 @@ impl SearchMode {
         free_list: &FreeList,
     ) -> Result<PageId, buffer::Error> {
         match self {
-            SearchMode::Start => branch.child_at(0, free_list).await,
+            SearchMode::Last => Ok(branch.right_child().unwrap()),
             SearchMode::Key(key) => branch.search_child(key, free_list).await,
         }
     }
@@ -82,10 +81,17 @@ impl SearchMode {
         &self,
         leaf: &leaf::Leaf<impl ByteSlice>,
         free_list: &FreeList,
-    ) -> Result<Result<usize, usize>, buffer::Error> {
+    ) -> Result<Result<usize, Option<usize>>, buffer::Error> {
         match self {
-            SearchMode::Start => Ok(Err(0)),
-            SearchMode::Key(key) => leaf.search_slot_id(key, free_list).await,
+            SearchMode::Last => Ok(Err(if leaf.num_pairs() == 0 {
+                None
+            } else {
+                Some(leaf.num_pairs() - 1)
+            })),
+            SearchMode::Key(key) => leaf
+                .search_slot_id(key, free_list)
+                .await
+                .map(|r| r.map_err(|i| if i == 0 { None } else { Some(i - 1) })),
         }
     }
 }
@@ -146,12 +152,10 @@ impl<'a> BTree<'a> {
                     let slot_id = search_mode
                         .tuple_slot_id(&leaf, self.free_list)
                         .await?
+                        .map(Some)
                         .unwrap_or_else(identity);
-                    return Ok(Iter {
-                        free_list: self.free_list,
-                        buffer: node_buffer_lock.into_inner(),
-                        slot_id,
-                    });
+
+                    return Ok(Iter::new(self.free_list, node_buffer_lock, slot_id).await?);
                 }
                 node::Body::Branch(branch) => {
                     let child_page_id = search_mode.child_page_id(&branch, self.free_list).await?;
@@ -181,13 +185,10 @@ impl<'a> BTree<'a> {
                     let slot_id = search_mode
                         .tuple_slot_id(&leaf, self.free_list)
                         .await?
+                        .map(Some)
                         .unwrap_or_else(identity);
                     return Ok((
-                        Iter {
-                            free_list: self.free_list,
-                            buffer: node_buffer_lock.into_inner(),
-                            slot_id,
-                        },
+                        Iter::new(self.free_list, node_buffer_lock, slot_id).await?,
                         height,
                     ));
                 }
@@ -467,18 +468,55 @@ impl<'a> BTree<'a> {
 
 pub struct Iter<'a> {
     free_list: &'a FreeList,
-    buffer: Arc<Buffer>,
+    read_lock: Option<WithReadLockGuard>,
     slot_id: usize,
 }
 
 impl<'a> Iter<'a> {
-    #[async_recursion]
+    async fn new(
+        free_list: &'a FreeList,
+        read_lock: WithReadLockGuard,
+        mut slot_id: Option<usize>,
+    ) -> Result<Iter<'a>, buffer::Error> {
+        let mut read_lock = Some(read_lock);
+        loop {
+            let lock = read_lock.as_ref().unwrap();
+            let leaf_node = node::Node::new(lock.as_bytes());
+            let leaf = leaf::Leaf::new(leaf_node.body);
+
+            if leaf.num_pairs() == 0 || slot_id.is_none() {
+                if let Some(prev_page_id) = leaf.prev_page_id() {
+                    let prev_read_lock =
+                        WithReadLockGuard::new(free_list.fetch_page(prev_page_id).await?).await;
+                    let prev_leaf_node = node::Node::new(prev_read_lock.as_bytes());
+                    let prev_leaf = leaf::Leaf::new(prev_leaf_node.body);
+
+                    if prev_leaf.num_pairs() > 0 {
+                        slot_id = Some(prev_leaf.num_pairs() - 1);
+                        read_lock = Some(prev_read_lock);
+                        break;
+                    }
+                    read_lock = Some(prev_read_lock);
+                    continue;
+                } else {
+                    read_lock = None;
+                }
+            }
+            break;
+        }
+
+        Ok(Iter {
+            free_list,
+            read_lock,
+            slot_id: slot_id.unwrap_or(0),
+        })
+    }
+
     async fn get(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
-        let buffer = self.buffer.clone();
-        let buffer_lock = buffer.page.read().await;
-        let leaf_node = node::Node::new(buffer_lock.as_bytes());
-        let leaf = leaf::Leaf::new(leaf_node.body);
-        if self.slot_id < leaf.num_pairs() {
+        if let Some(read_lock) = self.read_lock.as_ref() {
+            let leaf_node = node::Node::new(read_lock.as_bytes());
+            let leaf = leaf::Leaf::new(leaf_node.body);
+
             let data = leaf.data_at(self.slot_id, &self.free_list).await?;
             let pair = Pair::from_bytes(&data);
             Ok(Some((pair.key.to_vec(), pair.value.to_vec())))
@@ -488,23 +526,38 @@ impl<'a> Iter<'a> {
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
+    pub async fn prev(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, buffer::Error> {
         let value = self.get().await?;
 
         if value.is_some() {
-            self.slot_id += 1;
+            if self.slot_id == 0 {
+                loop {
+                    let read_lock = self.read_lock.as_ref().unwrap();
+                    let leaf_node = node::Node::new(read_lock.as_bytes());
+                    let leaf = leaf::Leaf::new(leaf_node.body);
 
-            let buffer = self.buffer.clone();
-            let buffer_lock = buffer.page.read().await;
-            let leaf_node = node::Node::new(buffer_lock.as_bytes());
-            let leaf = leaf::Leaf::new(leaf_node.body);
+                    if let Some(prev_page_id) = leaf.prev_page_id() {
+                        let prev_read_lock =
+                            WithReadLockGuard::new(self.free_list.fetch_page(prev_page_id).await?)
+                                .await;
 
-            if self.slot_id >= leaf.num_pairs() {
-                if let Some(page_id) = leaf.next_page_id() {
-                    let buffer = self.free_list.fetch_page(page_id).await?;
-                    self.buffer = buffer;
-                    self.slot_id = 0;
+                        let prev_leaf_node = node::Node::new(prev_read_lock.as_bytes());
+                        let prev_leaf = leaf::Leaf::new(prev_leaf_node.body);
+
+                        if prev_leaf.num_pairs() > 0 {
+                            self.slot_id = prev_leaf.num_pairs() - 1;
+                            self.read_lock = Some(prev_read_lock);
+                            break;
+                        } else {
+                            self.read_lock = Some(prev_read_lock);
+                        }
+                    } else {
+                        self.read_lock = None;
+                        break;
+                    }
                 }
+            } else {
+                self.slot_id -= 1;
             }
         }
 
@@ -532,7 +585,7 @@ mod tests {
         btree.insert(&6u64.to_be_bytes(), b"world").await.unwrap();
         btree.insert(&3u64.to_be_bytes(), b"hello").await.unwrap();
         btree.insert(&8u64.to_be_bytes(), b"!").await.unwrap();
-        btree.insert(&4u64.to_be_bytes(), b",").await.unwrap();
+        btree.insert(&5u64.to_be_bytes(), b",").await.unwrap();
 
         let (_, value) = btree
             .search(SearchMode::Key(3u64.to_be_bytes().to_vec()))
@@ -552,6 +605,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(b"!", &value[..]);
+
+        let (_, value) = btree
+            .search(SearchMode::Key(4u64.to_be_bytes().to_vec()))
+            .await
+            .unwrap()
+            .get()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b"hello", &value[..]);
     }
 
     #[tokio::test]
@@ -668,10 +731,10 @@ mod tests {
                 }
             }
 
-            let mut iter = btree.search(SearchMode::Start).await.unwrap();
+            let mut iter = btree.search(SearchMode::Last).await.unwrap();
             let mut snapshot: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
 
-            while let Some((key, value)) = iter.next().await.unwrap() {
+            while let Some((key, value)) = iter.prev().await.unwrap() {
                 snapshot.insert(key, value);
             }
             assert_eq!(snapshot.len(), memory.len());
