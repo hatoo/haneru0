@@ -15,7 +15,7 @@ pub struct Header {
 
 pub struct Branch<B> {
     header: LayoutVerified<B, Header>,
-    body: SlottedOverflow<B>,
+    pub body: SlottedOverflow<B>,
 }
 
 impl<B: ByteSlice> Branch<B> {
@@ -85,6 +85,10 @@ impl<B: ByteSlice> Branch<B> {
         free_list: &FreeList,
     ) -> Result<Cow<'_, [u8]>, buffer::Error> {
         Ok(self.body.fetch(slot_id, free_list).await?)
+    }
+
+    pub fn may_overflow(&self) -> bool {
+        self.body.may_overflow()
     }
 }
 

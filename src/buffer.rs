@@ -1,7 +1,7 @@
 use crate::disk::Aligned;
 use crate::disk::DiskManager;
 use crate::disk::PageId;
-use async_rwlock::{RwLock, RwLockWriteGuard};
+use async_rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     ops::{Deref, DerefMut},
@@ -35,6 +35,79 @@ impl DerefMut for Page {
 pub struct Buffer {
     pub page_id: PageId,
     pub page: RwLock<Page>,
+}
+
+pub struct WithReadLockGuard {
+    buffer: Arc<Buffer>,
+    lock: RwLockReadGuard<'static, Page>,
+}
+
+impl WithReadLockGuard {
+    pub async fn new(buffer: Arc<Buffer>) -> Self {
+        let lock = buffer.page.read().await;
+        Self {
+            lock: unsafe { std::mem::transmute(lock) },
+            buffer,
+        }
+    }
+
+    pub fn into_inner(self) -> Arc<Buffer> {
+        self.buffer
+    }
+}
+
+impl Deref for WithReadLockGuard {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        self.lock.deref()
+    }
+}
+
+pub struct WithWriteLockGuard {
+    buffer: Arc<Buffer>,
+    lock: RwLockWriteGuard<'static, Page>,
+}
+
+impl WithWriteLockGuard {
+    pub async fn new(buffer: Arc<Buffer>) -> Self {
+        let lock = buffer.page.write().await;
+        Self {
+            lock: unsafe { std::mem::transmute(lock) },
+            buffer,
+        }
+    }
+
+    pub fn try_new(buffer: Arc<Buffer>) -> Option<Self> {
+        let lock = buffer
+            .page
+            .try_write()
+            .map(|lock| unsafe { std::mem::transmute(lock) });
+
+        lock.map(|lock| Self { lock, buffer })
+    }
+
+    pub fn into_inner(self) -> Arc<Buffer> {
+        self.buffer
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.buffer.page_id
+    }
+}
+
+impl Deref for WithWriteLockGuard {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        self.lock.deref()
+    }
+}
+
+impl DerefMut for WithWriteLockGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.lock.deref_mut()
+    }
 }
 
 #[derive(Debug)]

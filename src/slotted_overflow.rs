@@ -94,7 +94,7 @@ impl Length {
 
 #[derive(Debug, FromBytes, AsBytes, Clone, Copy)]
 #[repr(C)]
-struct Pointer {
+pub struct Pointer {
     offset: u16,
     len: Length,
 }
@@ -191,7 +191,7 @@ impl<'a, B: ByteSlice> Iterator for FreedBlockIter<'a, B> {
 impl<B> SlottedOverflow<B> {
     const MAX_PAYLOAD_SIZE: usize = 1024;
 
-    fn actual_len(len: usize) -> usize {
+    pub fn actual_len(len: usize) -> usize {
         if len > Self::MAX_PAYLOAD_SIZE {
             size_of::<Overflow>()
         } else {
@@ -285,6 +285,10 @@ impl<B: ByteSlice> SlottedOverflow<B> {
                     .await?,
             ))
         }
+    }
+
+    pub fn may_overflow(&self) -> bool {
+        self.free_capacity() < size_of::<Pointer>() + Self::MAX_PAYLOAD_SIZE
     }
 }
 
