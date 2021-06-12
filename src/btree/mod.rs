@@ -856,4 +856,50 @@ mod tests {
             assert_eq!(min_height, max_height);
         }
     }
+
+    #[test]
+    #[cfg(loom)]
+    fn test_btree_loom_write() {
+        loom::model(|| {
+            const N: u8 = 4;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let disk_manager = DiskManager::default();
+                    let buffer_pool_manager = BufferPoolManager::new(disk_manager, 64);
+                    let free_list = Arc::new(FreeList::create(buffer_pool_manager).await.unwrap());
+                    let btree = BTree::create(&free_list).await.unwrap();
+                    let meta_page_id = btree.meta_page_id;
+
+                    let v = (0..N)
+                        .map(|i| {
+                            let free_list = free_list.clone();
+                            tokio::spawn(async move {
+                                let btree = BTree::new(meta_page_id, &&free_list);
+                                btree.insert(&[i], &[i; 1024]).await.unwrap();
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    for f in v {
+                        f.await.unwrap();
+                    }
+
+                    for i in 0..N {
+                        let (k, v) = btree
+                            .search(SearchMode::Key(vec![i]))
+                            .await
+                            .unwrap()
+                            .get()
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(&k, &[i]);
+                        assert_eq!(&v, &[i; 1024]);
+                    }
+                });
+        });
+    }
 }

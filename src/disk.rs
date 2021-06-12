@@ -1,6 +1,9 @@
 use crate::sync::{AtomicU64, Ordering};
+#[cfg(not(loom))]
 use fs2::FileExt;
-use std::{convert::TryInto, os::unix::fs::OpenOptionsExt};
+use std::convert::TryInto;
+#[cfg(not(loom))]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::File,
     ops::{Deref, DerefMut},
@@ -338,8 +341,8 @@ mod loom {
 
         pub(crate) fn write_page_data_sync(
             &self,
-            page_id: PageId,
-            data: &Aligned,
+            _page_id: PageId,
+            _data: &Aligned,
         ) -> Result<(), std::io::Error> {
             Ok(())
         }
