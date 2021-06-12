@@ -1,4 +1,5 @@
-use std::{convert::identity, mem::size_of, sync::Arc};
+use crate::sync::Arc;
+use std::{convert::identity, mem::size_of};
 
 use byteorder::{ByteOrder, NativeEndian};
 use serde::{Deserialize, Serialize};

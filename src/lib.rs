@@ -8,5 +8,6 @@ pub mod query;
 pub mod slotted;
 pub mod slotted_overflow;
 pub mod stack;
+mod sync;
 pub mod table;
 pub mod tuple;

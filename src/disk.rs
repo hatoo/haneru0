@@ -1,9 +1,9 @@
+use crate::sync::{AtomicU64, Ordering};
 use fs2::FileExt;
 use std::{convert::TryInto, os::unix::fs::OpenOptionsExt};
 use std::{
     fs::File,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU64, Ordering},
 };
 use zerocopy::{AsBytes, FromBytes};
 
@@ -78,75 +78,60 @@ impl From<&[u8]> for PageId {
     }
 }
 
-#[derive(Debug)]
-pub struct DiskManager {
-    heap_file: File,
-    ring: rio::Rio,
-    next_page_id: AtomicU64,
-}
+#[cfg(not(loom))]
+pub use self::imp::DiskManager;
 
-impl DiskManager {
-    pub fn new(heap_file: File) -> Result<Self, std::io::Error> {
-        heap_file.lock_exclusive()?;
-        let heap_file_size = heap_file.metadata()?.len();
-        let next_page_id = AtomicU64::new(heap_file_size / PAGE_SIZE as u64);
-        let ring = rio::new()?;
+#[cfg(loom)]
+pub use self::loom::DiskManager;
 
-        Ok(Self {
-            heap_file,
-            ring,
-            next_page_id,
-        })
+#[cfg(not(loom))]
+mod imp {
+    use super::*;
+
+    #[derive(Debug)]
+    pub struct DiskManager {
+        pub(crate) heap_file: File,
+        ring: rio::Rio,
+        next_page_id: AtomicU64,
     }
 
-    pub fn open(heap_file_path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
-        let heap_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(heap_file_path)?;
+    impl DiskManager {
+        pub fn new(heap_file: File) -> Result<Self, std::io::Error> {
+            heap_file.lock_exclusive()?;
+            let heap_file_size = heap_file.metadata()?.len();
+            let next_page_id = AtomicU64::new(heap_file_size / PAGE_SIZE as u64);
+            let ring = rio::new()?;
 
-        Self::new(heap_file)
-    }
+            Ok(Self {
+                heap_file,
+                ring,
+                next_page_id,
+            })
+        }
 
-    pub async fn read_page_data(
-        &self,
-        page_id: PageId,
-        data: &mut Aligned,
-    ) -> Result<(), std::io::Error> {
-        debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+        pub fn open(heap_file_path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
+            let heap_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(heap_file_path)?;
 
-        let at = page_id.0 * PAGE_SIZE as u64;
-        let mut read_len = loop {
-            match self
-                .ring
-                .read_at(&self.heap_file, data.deref_mut(), at)
-                .await
-            {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "failed to fill whole buffer",
-                    ))
-                }
-                Ok(n) => break n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        };
+            Self::new(heap_file)
+        }
 
-        while read_len < PAGE_SIZE {
-            let mut buf = Aligned::default();
-            let len = loop {
-                #[allow(clippy::unnecessary_mut_passed)]
+        pub async fn read_page_data(
+            &self,
+            page_id: PageId,
+            data: &mut Aligned,
+        ) -> Result<(), std::io::Error> {
+            debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+
+            let at = page_id.0 * PAGE_SIZE as u64;
+            let mut read_len = loop {
                 match self
                     .ring
-                    .read_at(
-                        &self.heap_file,
-                        &mut buf[..PAGE_SIZE - read_len].as_mut(),
-                        at + read_len as u64,
-                    )
+                    .read_at(&self.heap_file, data.deref_mut(), at)
                     .await
                 {
                     Ok(0) => {
@@ -161,47 +146,48 @@ impl DiskManager {
                 }
             };
 
-            data[read_len..read_len + len].copy_from_slice(&buf[..read_len]);
+            while read_len < PAGE_SIZE {
+                let mut buf = Aligned::default();
+                let len = loop {
+                    #[allow(clippy::unnecessary_mut_passed)]
+                    match self
+                        .ring
+                        .read_at(
+                            &self.heap_file,
+                            &mut buf[..PAGE_SIZE - read_len].as_mut(),
+                            at + read_len as u64,
+                        )
+                        .await
+                    {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "failed to fill whole buffer",
+                            ))
+                        }
+                        Ok(n) => break n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                };
 
-            read_len += len;
-        }
-        Ok(())
-    }
+                data[read_len..read_len + len].copy_from_slice(&buf[..read_len]);
 
-    pub async fn write_page_data(
-        &self,
-        page_id: PageId,
-        data: &Aligned,
-    ) -> Result<(), std::io::Error> {
-        debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
-
-        let at = page_id.0 * PAGE_SIZE as u64;
-        let mut written_len = loop {
-            match self.ring.write_at(&self.heap_file, &data.0, at).await {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ))
-                }
-                Ok(n) => break n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                read_len += len;
             }
-        };
-        while written_len < PAGE_SIZE {
-            let mut buf = Aligned::default();
-            buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
-            written_len += loop {
-                match self
-                    .ring
-                    .write_at(
-                        &self.heap_file,
-                        &buf[..PAGE_SIZE - written_len].as_ref(),
-                        at + written_len as u64,
-                    )
-                    .await
-                {
+            Ok(())
+        }
+
+        pub async fn write_page_data(
+            &self,
+            page_id: PageId,
+            data: &Aligned,
+        ) -> Result<(), std::io::Error> {
+            debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
+
+            let at = page_id.0 * PAGE_SIZE as u64;
+            let mut written_len = loop {
+                match self.ring.write_at(&self.heap_file, &data.0, at).await {
                     Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -213,45 +199,45 @@ impl DiskManager {
                     Err(e) => return Err(e),
                 }
             };
+            while written_len < PAGE_SIZE {
+                let mut buf = Aligned::default();
+                buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
+                written_len += loop {
+                    match self
+                        .ring
+                        .write_at(
+                            &self.heap_file,
+                            &buf[..PAGE_SIZE - written_len].as_ref(),
+                            at + written_len as u64,
+                        )
+                        .await
+                    {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write whole buffer",
+                            ))
+                        }
+                        Ok(n) => break n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                };
+            }
+
+            Ok(())
         }
 
-        Ok(())
-    }
+        pub(crate) fn write_page_data_sync(
+            &self,
+            page_id: PageId,
+            data: &Aligned,
+        ) -> Result<(), std::io::Error> {
+            debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
 
-    pub(crate) fn write_page_data_sync(
-        &self,
-        page_id: PageId,
-        data: &Aligned,
-    ) -> Result<(), std::io::Error> {
-        debug_assert!(page_id.0 < self.next_page_id.load(Ordering::Relaxed));
-
-        let at = page_id.0 * PAGE_SIZE as u64;
-        let mut written_len = loop {
-            match self.ring.write_at(&self.heap_file, &data.0, at).wait() {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ))
-                }
-                Ok(n) => break n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        };
-        while written_len < PAGE_SIZE {
-            let mut buf = Aligned::default();
-            buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
-            written_len += loop {
-                match self
-                    .ring
-                    .write_at(
-                        &self.heap_file,
-                        &buf[..PAGE_SIZE - written_len].as_ref(),
-                        at + written_len as u64,
-                    )
-                    .wait()
-                {
+            let at = page_id.0 * PAGE_SIZE as u64;
+            let mut written_len = loop {
+                match self.ring.write_at(&self.heap_file, &data.0, at).wait() {
                     Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -263,24 +249,116 @@ impl DiskManager {
                     Err(e) => return Err(e),
                 }
             };
+            while written_len < PAGE_SIZE {
+                let mut buf = Aligned::default();
+                buf[..PAGE_SIZE - written_len].copy_from_slice(&data[written_len..]);
+                written_len += loop {
+                    match self
+                        .ring
+                        .write_at(
+                            &self.heap_file,
+                            &buf[..PAGE_SIZE - written_len].as_ref(),
+                            at + written_len as u64,
+                        )
+                        .wait()
+                    {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write whole buffer",
+                            ))
+                        }
+                        Ok(n) => break n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                };
+            }
+
+            Ok(())
         }
 
-        Ok(())
-    }
+        pub fn allocate_page(&self) -> PageId {
+            PageId(self.next_page_id.fetch_add(1, Ordering::Relaxed))
+        }
 
-    pub fn allocate_page(&self) -> PageId {
-        PageId(self.next_page_id.fetch_add(1, Ordering::Relaxed))
-    }
+        pub async fn sync(&self) -> Result<(), std::io::Error> {
+            self.ring.fsync(&self.heap_file).await
+        }
 
-    pub async fn sync(&self) -> Result<(), std::io::Error> {
-        self.ring.fsync(&self.heap_file).await
-    }
-
-    pub async fn sync_data(&self) -> Result<(), std::io::Error> {
-        self.ring.fdatasync(&self.heap_file).await
+        pub async fn sync_data(&self) -> Result<(), std::io::Error> {
+            self.ring.fdatasync(&self.heap_file).await
+        }
     }
 }
 
+#[cfg(loom)]
+mod loom {
+    use super::*;
+    #[derive(Debug, Default)]
+    pub struct DiskManager {
+        buffer: tokio::sync::RwLock<std::collections::HashMap<PageId, Aligned>>,
+        next_page_id: AtomicU64,
+    }
+
+    impl DiskManager {
+        pub fn new(_heap_file: File) -> Result<Self, std::io::Error> {
+            Ok(Default::default())
+        }
+
+        pub fn open(_heap_file_path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
+            Ok(Default::default())
+        }
+
+        pub async fn read_page_data(
+            &self,
+            page_id: PageId,
+            data: &mut Aligned,
+        ) -> Result<(), std::io::Error> {
+            if let Some(r) = self.buffer.read().await.get(&page_id) {
+                data.copy_from_slice(r.as_bytes());
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "loom: read_page_data",
+                ))
+            }
+        }
+
+        pub async fn write_page_data(
+            &self,
+            page_id: PageId,
+            data: &Aligned,
+        ) -> Result<(), std::io::Error> {
+            self.buffer.write().await.insert(page_id, data.clone());
+
+            Ok(())
+        }
+
+        pub(crate) fn write_page_data_sync(
+            &self,
+            page_id: PageId,
+            data: &Aligned,
+        ) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        pub fn allocate_page(&self) -> PageId {
+            PageId(self.next_page_id.fetch_add(1, Ordering::Relaxed))
+        }
+
+        pub async fn sync(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        pub async fn sync_data(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(loom))]
 #[cfg(test)]
 mod tests {
     use rand::RngCore;

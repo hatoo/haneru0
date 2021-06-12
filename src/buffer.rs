@@ -1,12 +1,9 @@
 use crate::disk::Aligned;
 use crate::disk::DiskManager;
 use crate::disk::PageId;
+use crate::sync::{Arc, AtomicU64, Ordering};
 use async_rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::ops::{Deref, DerefMut};
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
 struct BufferId(usize);
 
@@ -149,7 +146,13 @@ impl<T: std::fmt::Debug> BufferPool<T> {
                     // Always Arc::strong_count(&f.buffer) == 1
                     {
                         debug_assert_eq!(Arc::strong_count(&f.buffer), 1);
+
+                        #[cfg(not(loom))]
                         let last = frame.take().map(|g| Arc::try_unwrap(g.buffer).unwrap());
+
+                        #[cfg(loom)]
+                        let last = None;
+
                         return Some((next_victim_id, last));
                     }
                     if Arc::get_mut(&mut f.buffer).is_some() {
@@ -457,56 +460,44 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_manager_concurrent() {
-        const N_PAGES: usize = 64;
+    #[cfg(loom)]
+    #[test]
+    fn test_buffer_pool_manager_loom() {
+        const N_PAGES: usize = 4;
         const POOL_SIZE: usize = 4;
-        const N_ITER: u8 = 16;
 
-        let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut pages = Vec::new();
-        {
-            let disk_manager = DiskManager::open(&path).unwrap();
-            let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
+        loom::model(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let disk_manager = DiskManager::default();
+                    let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
 
-            for _ in 0..N_PAGES {
-                pages.push(buffer_pool_manager.create_page().await.unwrap().page_id);
-            }
+                    let buffer_pool_manager = Arc::new(buffer_pool_manager);
 
-            let mut rng = thread_rng();
-            pages.shuffle(&mut rng);
-
-            let buffer_pool_manager = Arc::new(buffer_pool_manager);
-
-            let v = pages
-                .chunks(N_PAGES / POOL_SIZE)
-                .map(|page_ids| {
-                    let mut page_ids = page_ids.to_vec();
-                    let buffer_pool_manager = buffer_pool_manager.clone();
-                    tokio::spawn(async move {
-                        let mut rng = StdRng::from_entropy();
-                        for v in 1..=N_ITER {
-                            page_ids.shuffle(&mut rng);
-                            for &page_id in &page_ids {
+                    let v = (0..N_PAGES)
+                        .map(|i| {
+                            let buffer_pool_manager = buffer_pool_manager.clone();
+                            tokio::spawn(async move {
+                                let buffer = buffer_pool_manager.create_page().await.unwrap();
+                                let page_id = buffer.page_id;
+                                {
+                                    let mut lock = buffer.page.write().await;
+                                    lock.fill(i as u8);
+                                }
+                                drop(buffer);
                                 let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
-                                assert_eq!(page_id, buffer.page_id);
-                                let mut lock = buffer.page.write().await;
-                                lock.fill(v);
-                            }
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
+                                assert!(buffer.page.read().await.iter().all(|b| *b == i as u8));
+                            })
+                        })
+                        .collect::<Vec<_>>();
 
-            for f in v {
-                f.await.unwrap();
-            }
-        }
-        let disk_manager = DiskManager::open(&path).unwrap();
-        let buffer_pool_manager = BufferPoolManager::new(disk_manager, POOL_SIZE);
-        for page_id in pages {
-            let buffer = buffer_pool_manager.fetch_page(page_id).await.unwrap();
-            assert!(buffer.page.read().await.iter().all(|&v| v == N_ITER));
-        }
+                    for f in v {
+                        f.await.unwrap();
+                    }
+                })
+        })
     }
 }
